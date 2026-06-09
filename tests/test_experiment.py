@@ -45,6 +45,9 @@ def test_train_and_evaluate_one_tiny_uabla_step() -> None:
         device=torch.device("cpu"),
         log_every=1,
         direct_route_weight=0.1,
+        token_contrast_weight=0.1,
+        token_contrast_warmup_steps=1,
+        token_contrast_decay_steps=1,
         budget_weight=0.01,
     )
     metrics = evaluate(model, loader, device=torch.device("cpu"), batches=1)

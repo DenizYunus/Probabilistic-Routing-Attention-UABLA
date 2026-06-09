@@ -64,6 +64,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-checkpoint", type=Path)
     parser.add_argument("--distill-weight", type=float, default=0.0)
     parser.add_argument("--direct-route-weight", type=float, default=0.0)
+    parser.add_argument("--token-contrast-weight", type=float, default=0.0)
+    parser.add_argument("--token-contrast-warmup-steps", type=int, default=0)
+    parser.add_argument("--token-contrast-decay-steps", type=int, default=0)
+    parser.add_argument("--token-contrast-temperature", type=float, default=1.0)
     parser.add_argument("--budget-weight", type=float, default=0.0)
     parser.add_argument("--lm-loss-weight", type=float, default=0.2)
     parser.add_argument("--answer-loss-weight", type=float, default=1.0)
@@ -163,6 +167,10 @@ def main() -> None:
                 "grad_accum_steps": args.grad_accum_steps,
                 "distill_weight": args.distill_weight,
                 "direct_route_weight": args.direct_route_weight,
+                "token_contrast_weight": args.token_contrast_weight,
+                "token_contrast_warmup_steps": args.token_contrast_warmup_steps,
+                "token_contrast_decay_steps": args.token_contrast_decay_steps,
+                "token_contrast_temperature": args.token_contrast_temperature,
                 "budget_weight": args.budget_weight,
                 "log_every": args.log_every,
             },
@@ -180,6 +188,10 @@ def main() -> None:
         teacher=teacher,
         distill_weight=args.distill_weight,
         direct_route_weight=args.direct_route_weight,
+        token_contrast_weight=args.token_contrast_weight,
+        token_contrast_warmup_steps=args.token_contrast_warmup_steps,
+        token_contrast_decay_steps=args.token_contrast_decay_steps,
+        token_contrast_temperature=args.token_contrast_temperature,
         budget_weight=args.budget_weight,
         lm_loss_weight=args.lm_loss_weight,
         answer_loss_weight=args.answer_loss_weight,

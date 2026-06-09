@@ -76,6 +76,7 @@ class UABLAAttention(nn.Module):
         return_cache: bool = False,
         return_routing: bool = False,
         return_attention: bool = False,
+        return_token_scores: bool = False,
     ) -> torch.Tensor | UABLAOutput:
         if x.ndim != 3:
             raise ValueError("x must have shape [batch, seq, hidden]")
@@ -214,7 +215,7 @@ class UABLAAttention(nn.Module):
         if return_cache:
             cache = torch.cat([mu_store, log_sigma_store, compressed_value, position], dim=-1)
 
-        if return_cache or return_routing or return_attention:
+        if return_cache or return_routing or return_attention or return_token_scores:
             return UABLAOutput(
                 output=output,
                 cache=cache,
@@ -226,7 +227,7 @@ class UABLAAttention(nn.Module):
                 superblock_route_scores=superblock_route_scores if return_routing else None,
                 superblock_routeable_mask=superblock_routeable_mask if return_routing else None,
                 attention=attn if return_attention else None,
-                token_scores=scores if return_attention else None,
+                token_scores=scores if return_attention or return_token_scores else None,
                 memory_importance=memory_importance if return_routing else None,
             )
         return output

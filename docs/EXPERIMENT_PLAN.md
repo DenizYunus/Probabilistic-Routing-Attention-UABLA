@@ -142,6 +142,32 @@ This synthetic-only loss uses the known source value position for each query
 and trains the router to place probability mass on the matching block and
 superblock. It does not change inference.
 
+Token contrastive retrieval curriculum:
+
+```bash
+PYTHONPATH=src python scripts/run_synthetic.py \
+  --attention uabla \
+  --seq-len 256 \
+  --num-pairs 16 \
+  --num-queries 8 \
+  --steps 10000 \
+  --batch-size 8 \
+  --teacher-checkpoint runs/dense_teacher_256_mq.pt \
+  --distill-weight 0.3 \
+  --direct-route-weight 0.05 \
+  --token-contrast-weight 0.2 \
+  --token-contrast-warmup-steps 500 \
+  --token-contrast-decay-steps 4000 \
+  --token-contrast-temperature 0.7 \
+  --budget-weight 0.0
+```
+
+This loss ranks the true source token above other retrieved candidates in the
+final UABLA layer. It only applies when the source token is already in the
+candidate set, so it pairs naturally with a small direct routing weight. The
+warmup/decay schedule treats token labels as a temporary curriculum rather than
+a permanent oracle.
+
 ## Success Criteria For This Stage
 
 UABLA should:

@@ -162,6 +162,54 @@ def direct_routing_supervision_loss(
     return -torch.log(target_probs[valid].clamp_min(eps)).mean()
 
 
+def token_contrastive_retrieval_loss(
+    token_scores: torch.Tensor,
+    candidate_indices: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    answer_indices: torch.Tensor,
+    source_indices: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Contrastively rank the true source token above other retrieved candidates."""
+
+    if token_scores.shape != candidate_indices.shape or token_scores.shape != candidate_mask.shape:
+        raise ValueError("token_scores, candidate_indices, and candidate_mask must have same shape")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+
+    token_scores = token_scores.float()
+    batch, seq_len, _ = token_scores.shape
+    answer_indices = _ensure_query_dim(answer_indices).to(token_scores.device)
+    source_indices = _ensure_query_dim(source_indices).to(token_scores.device)
+    if answer_indices.shape != source_indices.shape:
+        raise ValueError("answer_indices and source_indices must have the same shape")
+    if answer_indices.shape[0] != batch:
+        raise ValueError("answer_indices batch dimension must match token_scores")
+
+    query_count = answer_indices.shape[1]
+    batch_indices = torch.arange(batch, device=token_scores.device).view(batch, 1)
+    batch_indices = batch_indices.expand(batch, query_count)
+    answer_indices = answer_indices.clamp(min=0, max=max(seq_len - 1, 0))
+
+    query_scores = token_scores[batch_indices, answer_indices] / temperature
+    query_indices = candidate_indices[batch_indices, answer_indices]
+    query_mask = candidate_mask[batch_indices, answer_indices]
+    positive_mask = query_mask & (query_indices == source_indices.unsqueeze(-1))
+    valid = positive_mask.any(dim=-1)
+    if not bool(valid.any()):
+        return token_scores.new_zeros(())
+
+    safe_scores = query_scores.masked_fill(~query_mask, torch.finfo(query_scores.dtype).min)
+    positive_scores = query_scores.masked_fill(
+        ~positive_mask,
+        torch.finfo(query_scores.dtype).min,
+    )
+    log_denominator = torch.logsumexp(safe_scores, dim=-1)
+    log_positive = torch.logsumexp(positive_scores, dim=-1)
+    return (log_denominator[valid] - log_positive[valid]).mean()
+
+
 def guarded_budget_loss(
     token_budgets: torch.Tensor,
     *,

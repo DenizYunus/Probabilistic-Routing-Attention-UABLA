@@ -110,6 +110,7 @@ class TransformerBlock(nn.Module):
         *,
         return_routing: bool = False,
         return_attention: bool = False,
+        return_token_scores: bool = False,
     ) -> tuple[torch.Tensor, UABLAOutput | None, torch.Tensor | None]:
         attention_input = self.norm1(x)
         uabla_output = None
@@ -119,6 +120,7 @@ class TransformerBlock(nn.Module):
                 attention_input,
                 return_routing=return_routing,
                 return_attention=return_attention,
+                return_token_scores=return_token_scores,
             )
             if isinstance(attention_result, UABLAOutput):
                 attention_output = attention_result.output
@@ -201,6 +203,7 @@ class TinyTransformerLM(nn.Module):
         *,
         return_routing: bool = False,
         return_attention: bool = False,
+        return_token_scores: bool = False,
     ) -> TinyLMOutput:
         batch, seq_len = input_ids.shape
         if seq_len > self.max_seq_len:
@@ -210,11 +213,12 @@ class TinyTransformerLM(nn.Module):
         x = self.drop(x)
         uabla_outputs: list[UABLAOutput] = []
         dense_attentions: list[torch.Tensor] = []
-        for block in self.blocks:
+        for block_idx, block in enumerate(self.blocks):
             x, uabla_output, dense_attention = block(
                 x,
                 return_routing=return_routing,
                 return_attention=return_attention,
+                return_token_scores=return_token_scores and block_idx == len(self.blocks) - 1,
             )
             if uabla_output is not None:
                 uabla_outputs.append(uabla_output)

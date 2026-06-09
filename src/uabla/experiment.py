@@ -21,6 +21,7 @@ from .losses import (
     guarded_budget_loss,
     routing_diagnostics,
     routing_distillation_loss,
+    token_contrastive_retrieval_loss,
 )
 from .model import TinyTransformerLM
 from .synthetic import KeyValueRecallDataset, answer_accuracy, answer_cross_entropy
@@ -90,6 +91,10 @@ def train_steps(
     answer_loss_weight: float = 1.0,
     distill_weight: float = 0.0,
     direct_route_weight: float = 0.0,
+    token_contrast_weight: float = 0.0,
+    token_contrast_warmup_steps: int = 0,
+    token_contrast_decay_steps: int = 0,
+    token_contrast_temperature: float = 1.0,
     budget_weight: float = 0.0,
     grad_clip: float | None = 1.0,
     grad_accum_steps: int = 1,
@@ -104,6 +109,8 @@ def train_steps(
         raise ModuleNotFoundError("train_steps requires torch")
     if grad_accum_steps <= 0:
         raise ValueError("grad_accum_steps must be positive")
+    if token_contrast_warmup_steps < 0 or token_contrast_decay_steps < 0:
+        raise ValueError("token contrast schedule steps must be non-negative")
     if amp_dtype is None:
         amp_dtype = torch.float16
     model.train()
@@ -118,6 +125,12 @@ def train_steps(
     start_time = time.perf_counter()
     token_count = 0
     for step in range(1, steps + 1):
+        current_token_contrast_weight = _scheduled_aux_weight(
+            token_contrast_weight,
+            step=step,
+            warmup_steps=token_contrast_warmup_steps,
+            decay_steps=token_contrast_decay_steps,
+        )
         optimizer.zero_grad(set_to_none=True)
         last_batch = None
         last_output = None
@@ -126,11 +139,13 @@ def train_steps(
         for _ in range(grad_accum_steps):
             batch = move_batch(next(stream), device)
             needs_aux = model.attention_type == "uabla"
+            needs_token_scores = needs_aux and current_token_contrast_weight > 0
             with _autocast_context(device, enabled=amp, dtype=amp_dtype):
                 output = model(
                     batch["input_ids"],
                     return_routing=needs_aux,
                     return_attention=False,
+                    return_token_scores=needs_token_scores,
                 )
                 lm_loss = language_model_loss(output.logits, batch["labels"])
                 ans_loss = answer_cross_entropy(output.logits, batch)
@@ -213,6 +228,28 @@ def train_steps(
                             )
                     if direct_route_losses:
                         loss = loss + direct_route_weight * torch.stack(direct_route_losses).mean()
+
+                if (
+                    current_token_contrast_weight > 0
+                    and output.uabla_outputs
+                    and "answer_source_index" in batch
+                ):
+                    token_contrast_losses = [
+                        token_contrastive_retrieval_loss(
+                            layer.token_scores,
+                            layer.candidates.indices,
+                            layer.candidates.mask,
+                            batch["answer_index"],
+                            batch["answer_source_index"],
+                            temperature=token_contrast_temperature,
+                        )
+                        for layer in output.uabla_outputs
+                        if layer.token_scores is not None and layer.candidates is not None
+                    ]
+                    if token_contrast_losses:
+                        loss = loss + current_token_contrast_weight * torch.stack(
+                            token_contrast_losses,
+                        ).mean()
 
                 if budget_weight > 0 and output.uabla_outputs:
                     budget_losses = [
@@ -372,6 +409,24 @@ def _autocast_context(
     if not enabled or device.type not in {"cuda", "cpu", "mps"}:
         return nullcontext()
     return torch.amp.autocast(device_type=device.type, dtype=dtype)
+
+
+def _scheduled_aux_weight(
+    weight: float,
+    *,
+    step: int,
+    warmup_steps: int,
+    decay_steps: int,
+) -> float:
+    if weight <= 0:
+        return 0.0
+    factor = 1.0
+    if warmup_steps > 0:
+        factor *= min(1.0, step / float(warmup_steps))
+    if decay_steps > 0 and step > warmup_steps:
+        decay_progress = (step - warmup_steps) / float(decay_steps)
+        factor *= max(0.0, 1.0 - decay_progress)
+    return weight * factor
 
 
 def _peak_memory_mb(device: torch.device) -> float | None:
