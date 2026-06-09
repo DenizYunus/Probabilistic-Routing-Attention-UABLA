@@ -1,0 +1,190 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="1050" viewBox="0 0 1600 1050" role="img" aria-labelledby="title desc">
+  <title id="title">UABLA Architecture Diagram</title>
+  <desc id="desc">Diagram of the UABLA transformer block, compact cache, hierarchical routing, and retrieval path.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f7faf9; }
+      .panel { fill: #ffffff; stroke: #cbd8d2; stroke-width: 2; rx: 14; }
+      .panel-soft { fill: #eef7f4; stroke: #b7cdc5; stroke-width: 1.6; rx: 12; }
+      .box { fill: #ffffff; stroke: #8fb2a7; stroke-width: 1.7; rx: 10; }
+      .box-blue { fill: #eef5fb; stroke: #83a7c4; stroke-width: 1.7; rx: 10; }
+      .box-green { fill: #eef8ef; stroke: #8bb98f; stroke-width: 1.7; rx: 10; }
+      .box-gold { fill: #fff8e8; stroke: #c8a85c; stroke-width: 1.7; rx: 10; }
+      .box-red { fill: #fff1ed; stroke: #d99b87; stroke-width: 1.7; rx: 10; }
+      .tiny { font: 500 16px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #43524d; }
+      .small { font: 600 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #24342f; }
+      .label { font: 700 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #17211e; }
+      .title { font: 800 36px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #101817; }
+      .subtitle { font: 500 20px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #4a5b55; }
+      .code { font: 600 17px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1f302b; }
+      .arrow { fill: none; stroke: #4f746a; stroke-width: 2.4; marker-end: url(#arrow); }
+      .arrow-light { fill: none; stroke: #85a69c; stroke-width: 2; marker-end: url(#arrowLight); }
+      .dash { fill: none; stroke: #7e928d; stroke-width: 2; stroke-dasharray: 7 7; marker-end: url(#arrowLight); }
+      .chip { fill: #dcefeb; stroke: #95b9af; stroke-width: 1.2; rx: 16; }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#4f746a"/>
+    </marker>
+    <marker id="arrowLight" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto">
+      <path d="M 0 0 L 12 6 L 0 12 z" fill="#85a69c"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1600" height="1050"/>
+
+  <text class="title" x="60" y="64">UABLA: Uncertainty-Adaptive Block Latent Attention</text>
+  <text class="subtitle" x="60" y="96">Compact probabilistic token cache + four-centroid hierarchical routing + sparse token retrieval</text>
+
+  <rect class="chip" x="1110" y="42" width="420" height="34"/>
+  <text class="code" x="1130" y="65">current Colab run: hidden=128, cache=144</text>
+  <rect class="chip" x="1110" y="84" width="420" height="34"/>
+  <text class="code" x="1130" y="107">locked full V1: UABLA-448 cache</text>
+
+  <!-- Top model flow -->
+  <rect class="panel" x="60" y="140" width="1480" height="170"/>
+  <text class="label" x="88" y="178">Transformer LM wrapper</text>
+
+  <rect class="box-blue" x="90" y="210" width="190" height="62"/>
+  <text class="small" x="116" y="236">Input tokens</text>
+  <text class="tiny" x="116" y="260">token + position emb</text>
+
+  <rect class="box" x="350" y="198" width="230" height="86"/>
+  <text class="small" x="390" y="226">Transformer block</text>
+  <text class="tiny" x="390" y="250">LayerNorm + UABLA</text>
+  <text class="tiny" x="390" y="272">Residual + MLP</text>
+
+  <rect class="box" x="650" y="198" width="230" height="86"/>
+  <text class="small" x="690" y="226">Transformer block</text>
+  <text class="tiny" x="690" y="250">repeated x layers</text>
+  <text class="tiny" x="690" y="272">4 layers in current run</text>
+
+  <rect class="box-blue" x="950" y="210" width="190" height="62"/>
+  <text class="small" x="996" y="236">Final norm</text>
+  <text class="tiny" x="993" y="260">hidden state</text>
+
+  <rect class="box-green" x="1210" y="210" width="190" height="62"/>
+  <text class="small" x="1264" y="236">LM head</text>
+  <text class="tiny" x="1248" y="260">next-token logits</text>
+
+  <path class="arrow" d="M 280 241 L 345 241"/>
+  <path class="arrow" d="M 580 241 L 645 241"/>
+  <path class="arrow" d="M 880 241 L 945 241"/>
+  <path class="arrow" d="M 1140 241 L 1205 241"/>
+
+  <!-- Block internals -->
+  <rect class="panel" x="60" y="350" width="1480" height="620"/>
+  <text class="label" x="88" y="388">Inside one UABLA attention layer</text>
+
+  <!-- Column 1: projections -->
+  <rect class="panel-soft" x="90" y="425" width="310" height="485"/>
+  <text class="label" x="118" y="462">1. Project</text>
+  <text class="tiny" x="118" y="490">LayerNorm hidden state x</text>
+
+  <rect class="box-blue" x="120" y="525" width="250" height="56"/>
+  <text class="small" x="146" y="550">Seek distribution</text>
+  <text class="code" x="146" y="572">q_mu, q_log_sigma</text>
+
+  <rect class="box-blue" x="120" y="605" width="250" height="56"/>
+  <text class="small" x="146" y="630">Store distribution</text>
+  <text class="code" x="146" y="652">s_mu, s_log_sigma</text>
+
+  <rect class="box-green" x="120" y="685" width="250" height="56"/>
+  <text class="small" x="146" y="710">Compressed value</text>
+  <text class="code" x="146" y="732">v_down(x)</text>
+
+  <rect class="box-gold" x="120" y="765" width="250" height="56"/>
+  <text class="small" x="146" y="790">Position + importance</text>
+  <text class="code" x="146" y="812">pos_down, mem score</text>
+
+  <!-- Column 2: cache -->
+  <rect class="panel-soft" x="445" y="425" width="340" height="485"/>
+  <text class="label" x="473" y="462">2. Compact cache</text>
+  <text class="tiny" x="473" y="490">Stored per previous token per layer</text>
+
+  <rect class="box" x="475" y="530" width="280" height="210"/>
+  <text class="small" x="504" y="560">cache_t = concat(...)</text>
+  <line x1="500" y1="585" x2="730" y2="585" stroke="#b7cdc5" stroke-width="1.4"/>
+  <text class="code" x="505" y="615">mu_store</text>
+  <text class="tiny" x="640" y="615">32 now / 64 V1</text>
+  <text class="code" x="505" y="648">log_sigma_store</text>
+  <text class="tiny" x="640" y="648">32 now / 64 V1</text>
+  <text class="code" x="505" y="681">compressed_value</text>
+  <text class="tiny" x="640" y="681">64 now / 256 V1</text>
+  <text class="code" x="505" y="714">position payload</text>
+  <text class="tiny" x="640" y="714">16 now / 64 V1</text>
+
+  <rect class="box-green" x="475" y="765" width="280" height="80"/>
+  <text class="small" x="504" y="794">Cache objective</text>
+  <text class="tiny" x="504" y="818">lower KV memory while keeping</text>
+  <text class="tiny" x="504" y="840">retrievable long-context signal</text>
+
+  <!-- Column 3: routing hierarchy -->
+  <rect class="panel-soft" x="830" y="425" width="340" height="485"/>
+  <text class="label" x="858" y="462">3. Route hierarchy</text>
+  <text class="tiny" x="858" y="490">No full T x T distance matrix</text>
+
+  <rect class="box-gold" x="860" y="525" width="280" height="62"/>
+  <text class="small" x="892" y="550">4 centroids per block</text>
+  <text class="tiny" x="892" y="572">soft assignment over token stores</text>
+
+  <rect class="box-gold" x="860" y="615" width="280" height="62"/>
+  <text class="small" x="888" y="640">4 centroids per superblock</text>
+  <text class="tiny" x="888" y="662">aggregate child block centroids</text>
+
+  <rect class="box-red" x="860" y="705" width="280" height="76"/>
+  <text class="small" x="894" y="731">Uncertainty budgets</text>
+  <text class="code" x="894" y="754">superblock, centroid, token</text>
+  <text class="tiny" x="894" y="776">higher uncertainty opens more</text>
+
+  <rect class="box" x="860" y="810" width="280" height="60"/>
+  <text class="small" x="896" y="836">Always add local window</text>
+  <text class="tiny" x="896" y="858">causal recent context is included</text>
+
+  <path class="arrow-light" d="M 1000 588 L 1000 610"/>
+  <path class="arrow-light" d="M 1000 678 L 1000 700"/>
+  <path class="arrow-light" d="M 1000 782 L 1000 805"/>
+
+  <!-- Column 4: retrieval -->
+  <rect class="panel-soft" x="1215" y="425" width="295" height="485"/>
+  <text class="label" x="1243" y="462">4. Retrieve</text>
+  <text class="tiny" x="1243" y="490">Sparse candidate attention</text>
+
+  <rect class="box-blue" x="1245" y="525" width="235" height="76"/>
+  <text class="small" x="1268" y="550">Candidate scoring</text>
+  <text class="code" x="1268" y="573">-Gaussian distance</text>
+  <text class="tiny" x="1268" y="593">+ hybrid + position + importance</text>
+
+  <rect class="box-red" x="1245" y="630" width="235" height="76"/>
+  <text class="small" x="1268" y="655">Straight-through top-k</text>
+  <text class="tiny" x="1268" y="678">hard sparse route in forward</text>
+  <text class="tiny" x="1268" y="698">soft gradient path in backward</text>
+
+  <rect class="box-green" x="1245" y="735" width="235" height="76"/>
+  <text class="small" x="1268" y="760">Mix compressed values</text>
+  <text class="tiny" x="1268" y="783">weighted sum in value_dim</text>
+  <text class="tiny" x="1268" y="803">then v_up once per token</text>
+
+  <rect class="box" x="1245" y="840" width="235" height="50"/>
+  <text class="small" x="1290" y="871">out projection</text>
+
+  <path class="arrow-light" d="M 1362 602 L 1362 625"/>
+  <path class="arrow-light" d="M 1362 707 L 1362 730"/>
+  <path class="arrow-light" d="M 1362 812 L 1362 835"/>
+
+  <!-- Cross-column arrows -->
+  <path class="arrow" d="M 370 633 C 410 633 425 633 470 633"/>
+  <path class="arrow" d="M 755 630 C 795 630 815 550 855 550"/>
+  <path class="arrow" d="M 755 630 C 800 630 815 650 855 650"/>
+  <path class="arrow" d="M 1140 748 C 1185 748 1200 565 1240 565"/>
+  <path class="dash" d="M 370 552 C 760 360 1110 360 1240 545"/>
+  <path class="arrow" d="M 1480 865 C 1518 865 1522 276 1404 252"/>
+
+  <!-- Bottom callouts -->
+  <rect class="panel" x="60" y="995" width="1480" height="1" opacity="0"/>
+  <rect class="chip" x="90" y="935" width="430" height="38"/>
+  <text class="code" x="112" y="960">Current toy config: block=16, superblock=4 blocks, token_k&lt;=16</text>
+  <rect class="chip" x="550" y="935" width="450" height="38"/>
+  <text class="code" x="572" y="960">Full V1 target: block=128, superblock=8 blocks, cache=448</text>
+  <rect class="chip" x="1030" y="935" width="430" height="38"/>
+  <text class="code" x="1052" y="960">Claim under test: lower cache memory, dense-like long recall</text>
+</svg>

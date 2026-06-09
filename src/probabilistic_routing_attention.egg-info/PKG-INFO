@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: probabilistic-routing-attention
+Version: 0.1.0
+Summary: UABLA-448: Uncertainty-Adaptive Block Latent Attention prototype
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.26
+Requires-Dist: torch>=2.1
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
