@@ -79,3 +79,21 @@ def test_token_scores_are_returned_only_for_final_uabla_layer() -> None:
     assert len(output.uabla_outputs) == 2
     assert output.uabla_outputs[0].token_scores is None
     assert output.uabla_outputs[1].token_scores is not None
+
+
+def test_input_mixer_preserves_tiny_model_shape() -> None:
+    vocab_size = 32
+    seq_len = 12
+    input_ids = torch.randint(0, vocab_size, (2, seq_len))
+    model = TinyTransformerLM(
+        vocab_size=vocab_size,
+        max_seq_len=seq_len,
+        hidden_size=16,
+        num_layers=1,
+        attention_type="dense",
+        input_mixer_kernel=3,
+    )
+
+    output = model(input_ids)
+
+    assert output.logits.shape == (2, seq_len, vocab_size)

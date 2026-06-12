@@ -203,3 +203,62 @@ PG-19/books
 small code corpus
 Wikipedia dumps or Hugging Face Wikipedia datasets
 ```
+
+## Tokenizer-Free Byte LM Track
+
+Byte-level language modeling is the first real-text bridge. It uses raw UTF-8
+byte IDs `0..255` plus reserved special IDs, so there is no BPE tokenizer. A
+causal local convolutional mixer can be enabled before attention with
+`--byte-mixer-kernel`. UABLA keeps byte-level next-token prediction but routes
+over latent byte chunks controlled by `--byte-route-patch-size`.
+
+Dense byte LM:
+
+```bash
+PYTHONPATH=src python scripts/run_byte_lm.py \
+  --attention dense \
+  --text-file data/wiki_sample.txt \
+  --seq-len 512 \
+  --steps 5000 \
+  --batch-size 8 \
+  --hidden-size 128 \
+  --layers 4 \
+  --byte-mixer-kernel 5 \
+  --amp \
+  --log-every 100 \
+  2>&1 | tee runs/byte_dense.log
+```
+
+UABLA byte LM:
+
+```bash
+PYTHONPATH=src python scripts/run_byte_lm.py \
+  --attention uabla \
+  --text-file data/wiki_sample.txt \
+  --seq-len 512 \
+  --steps 5000 \
+  --batch-size 8 \
+  --hidden-size 128 \
+  --layers 4 \
+  --byte-mixer-kernel 5 \
+  --byte-route-patch-size 16 \
+  --amp \
+  --log-every 100 \
+  2>&1 | tee runs/byte_uabla.log
+```
+
+Primary metrics:
+
+```text
+loss
+byte_accuracy
+byte_perplexity
+tokens_per_second
+cache_dim_per_token_per_layer
+route_entropy
+avg_open_blocks
+avg_token_budget
+```
+
+The first byte-LM goal is not to beat dense immediately. It is to measure
+whether UABLA degrades more gracefully as raw-byte sequence length grows.

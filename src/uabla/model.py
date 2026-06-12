@@ -68,6 +68,37 @@ class DenseCausalSelfAttention(nn.Module):
         return output
 
 
+class CausalConvMixer(nn.Module):
+    """Cheap local byte/token mixer used before global attention.
+
+    The convolution is left-padded only, so token representations never see
+    future positions before the causal transformer stack.
+    """
+
+    def __init__(self, hidden_size: int, *, kernel_size: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        if kernel_size <= 1:
+            raise ValueError("kernel_size must be greater than 1")
+        self.kernel_size = kernel_size
+        self.depthwise = nn.Conv1d(
+            hidden_size,
+            hidden_size,
+            kernel_size,
+            groups=hidden_size,
+            bias=False,
+        )
+        self.pointwise = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = x.transpose(1, 2)
+        y = F.pad(y, (self.kernel_size - 1, 0))
+        y = self.depthwise(y).transpose(1, 2)
+        y = self.pointwise(F.gelu(y))
+        return self.norm(x + self.dropout(y))
+
+
 class TransformerBlock(nn.Module):
     def __init__(
         self,
@@ -155,10 +186,13 @@ class TinyTransformerLM(nn.Module):
         dropout: float = 0.0,
         uabla_config: UABLAConfig | None = None,
         uabla_vectorized_routing: bool = True,
+        input_mixer_kernel: int = 0,
     ) -> None:
         super().__init__()
         if torch is None:
             raise ModuleNotFoundError("TinyTransformerLM requires torch")
+        if input_mixer_kernel < 0:
+            raise ValueError("input_mixer_kernel cannot be negative")
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
         self.hidden_size = hidden_size
@@ -179,6 +213,11 @@ class TinyTransformerLM(nn.Module):
             )
         self.uabla_config = uabla_config
         self.token_embedding = nn.Embedding(vocab_size, hidden_size)
+        self.input_mixer = (
+            CausalConvMixer(hidden_size, kernel_size=input_mixer_kernel, dropout=dropout)
+            if input_mixer_kernel > 1
+            else None
+        )
         self.position_embedding = nn.Embedding(max_seq_len, hidden_size)
         self.drop = nn.Dropout(dropout)
         self.blocks = nn.ModuleList(
@@ -209,7 +248,10 @@ class TinyTransformerLM(nn.Module):
         if seq_len > self.max_seq_len:
             raise ValueError(f"sequence length {seq_len} exceeds max_seq_len {self.max_seq_len}")
         positions = torch.arange(seq_len, device=input_ids.device).view(1, seq_len)
-        x = self.token_embedding(input_ids) + self.position_embedding(positions)
+        x = self.token_embedding(input_ids)
+        if self.input_mixer is not None:
+            x = self.input_mixer(x)
+        x = x + self.position_embedding(positions)
         x = self.drop(x)
         uabla_outputs: list[UABLAOutput] = []
         dense_attentions: list[torch.Tensor] = []
