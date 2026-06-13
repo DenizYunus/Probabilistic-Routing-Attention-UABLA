@@ -251,8 +251,11 @@ Primary metrics:
 
 ```text
 loss
+lm_loss
 byte_accuracy
 byte_perplexity
+answer_accuracy for needle tasks
+answer_loss for needle tasks
 tokens_per_second
 cache_dim_per_token_per_layer
 route_entropy
@@ -262,3 +265,90 @@ avg_token_budget
 
 The first byte-LM goal is not to beat dense immediately. It is to measure
 whether UABLA degrades more gracefully as raw-byte sequence length grows.
+
+## Byte Needle Recall
+
+Plain byte LM is mostly local at 512 bytes. To test long-range routing, use
+the `needle` task. It injects a random alphanumeric byte code:
+
+```text
+SECRET_CODE: A7K2...
+... long story gap ...
+QUESTION: What is the SECRET_CODE?
+ANSWER: A7K2...
+```
+
+Answer metrics are measured only on the answer code bytes. Local attention
+should fail when `--needle-min-gap` is larger than `--local-window`.
+
+Dense:
+
+```bash
+PYTHONPATH=src python scripts/run_byte_lm.py \
+  --task needle \
+  --attention dense \
+  --text-file data/tinystories_combo.txt \
+  --seq-len 1024 \
+  --needle-min-gap 768 \
+  --needle-code-length 12 \
+  --steps 5000 \
+  --batch-size 8 \
+  --hidden-size 128 \
+  --layers 4 \
+  --byte-mixer-kernel 5 \
+  --lm-loss-weight 0.2 \
+  --answer-loss-weight 5.0 \
+  --amp \
+  --log-every 100 \
+  2>&1 | tee runs/byte_needle_dense.log
+```
+
+Local:
+
+```bash
+PYTHONPATH=src python scripts/run_byte_lm.py \
+  --task needle \
+  --attention local \
+  --text-file data/tinystories_combo.txt \
+  --seq-len 1024 \
+  --needle-min-gap 768 \
+  --needle-code-length 12 \
+  --local-window 128 \
+  --steps 5000 \
+  --batch-size 8 \
+  --hidden-size 128 \
+  --layers 4 \
+  --byte-mixer-kernel 5 \
+  --lm-loss-weight 0.2 \
+  --answer-loss-weight 5.0 \
+  --amp \
+  --log-every 100 \
+  2>&1 | tee runs/byte_needle_local.log
+```
+
+UABLA with memory-lite diagnostics:
+
+```bash
+PYTHONPATH=src python scripts/run_byte_lm.py \
+  --task needle \
+  --attention uabla \
+  --text-file data/tinystories_combo.txt \
+  --seq-len 1024 \
+  --needle-min-gap 768 \
+  --needle-code-length 12 \
+  --local-window 128 \
+  --steps 5000 \
+  --batch-size 8 \
+  --hidden-size 128 \
+  --layers 4 \
+  --byte-mixer-kernel 5 \
+  --byte-route-patch-size 16 \
+  --routed-span-left 4 \
+  --routed-span-right 12 \
+  --lm-loss-weight 0.2 \
+  --answer-loss-weight 5.0 \
+  --diagnostics-every 500 \
+  --amp \
+  --log-every 100 \
+  2>&1 | tee runs/byte_needle_uabla.log
+```

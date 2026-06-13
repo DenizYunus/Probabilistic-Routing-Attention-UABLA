@@ -6,6 +6,8 @@ torch = pytest.importorskip("torch")
 
 from uabla import UABLAConfig
 from uabla.routing import (
+    _expand_candidate_spans,
+    _mask_duplicate_candidates,
     build_candidate_indices,
     build_candidate_indices_vectorized,
     compute_centroid_route_scores,
@@ -141,6 +143,33 @@ def test_vectorized_candidate_indices_are_causal_and_fixed_shape() -> None:
             valid = candidates.indices[batch_idx, token_idx][candidates.mask[batch_idx, token_idx]]
             assert valid.numel() > 0
             assert int(valid.max().item()) <= token_idx
+
+
+def test_duplicate_candidate_mask_keeps_first_occurrence() -> None:
+    indices = torch.tensor([[[0, 1, 1, 2, 0, 3, -1]]])
+    mask = torch.tensor([[[True, True, True, True, True, True, False]]])
+
+    _, deduped = _mask_duplicate_candidates(indices, mask)
+
+    assert deduped.tolist() == [[[True, True, False, True, False, True, False]]]
+
+
+def test_candidate_span_expansion_is_causal() -> None:
+    indices = torch.tensor([[[0, 0], [0, 1], [1, 2]]])
+    mask = torch.tensor([[[True, True], [True, True], [True, True]]])
+
+    expanded, expanded_mask = _expand_candidate_spans(
+        indices,
+        mask,
+        seq_len=8,
+        left=1,
+        right=2,
+    )
+
+    assert expanded.shape[-1] == indices.shape[-1] * 4
+    for token_idx in range(expanded.shape[1]):
+        valid = expanded[0, token_idx][expanded_mask[0, token_idx]]
+        assert int(valid.max().item()) <= token_idx
 
 
 def test_route_scores_are_block_level_not_token_pair_level() -> None:

@@ -17,6 +17,8 @@ from uabla.byte_lm import (
     ByteLMConfig,
     ByteLMMetrics,
     ByteLanguageModelingDataset,
+    ByteNeedleRecallConfig,
+    ByteNeedleRecallDataset,
     bytes_to_ids,
     ensure_min_bytes,
     evaluate_byte_lm,
@@ -57,6 +59,7 @@ def amp_dtype_from_arg(value: str) -> torch.dtype:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--attention", choices=["uabla", "dense", "local"], default="uabla")
+    parser.add_argument("--task", choices=["lm", "needle"], default="lm")
     parser.add_argument("--byte-mode", choices=["raw"], default="raw")
     parser.add_argument("--text-file", type=Path)
     parser.add_argument("--seq-len", type=int, default=256)
@@ -71,11 +74,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--local-window", type=int, default=128)
     parser.add_argument("--byte-mixer-kernel", type=int, default=5)
     parser.add_argument("--byte-route-patch-size", type=int, default=16)
+    parser.add_argument("--routed-span-left", type=int, default=0)
+    parser.add_argument("--routed-span-right", type=int, default=0)
+    parser.add_argument("--needle-code-length", type=int, default=12)
+    parser.add_argument("--needle-min-gap", type=int, default=768)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--device", default=default_device())
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--diagnostics-every", type=int, default=0)
+    parser.add_argument("--no-eval-diagnostics", action="store_true")
     parser.add_argument("--eval-batches", type=int, default=32)
+    parser.add_argument("--lm-loss-weight", type=float, default=1.0)
+    parser.add_argument("--answer-loss-weight", type=float, default=0.0)
     parser.add_argument("--no-vectorized-routing", action="store_true")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="float16")
@@ -98,23 +109,43 @@ def main() -> None:
         eval_fraction=args.eval_fraction,
     )
 
-    train_config = ByteLMConfig(
-        seq_len=args.seq_len,
-        dataset_size=args.train_size,
-        seed=args.seed,
-    )
-    eval_config = ByteLMConfig(
-        seq_len=args.seq_len,
-        dataset_size=args.eval_size,
-        seed=args.seed + 10_000,
-    )
+    if args.task == "lm":
+        train_config = ByteLMConfig(
+            seq_len=args.seq_len,
+            dataset_size=args.train_size,
+            seed=args.seed,
+        )
+        eval_config = ByteLMConfig(
+            seq_len=args.seq_len,
+            dataset_size=args.eval_size,
+            seed=args.seed + 10_000,
+        )
+        train_dataset = ByteLanguageModelingDataset(train_bytes, train_config)
+        eval_dataset = ByteLanguageModelingDataset(eval_bytes, eval_config)
+    else:
+        train_config = ByteNeedleRecallConfig(
+            seq_len=args.seq_len,
+            dataset_size=args.train_size,
+            seed=args.seed,
+            code_length=args.needle_code_length,
+            min_gap=args.needle_min_gap,
+        )
+        eval_config = ByteNeedleRecallConfig(
+            seq_len=args.seq_len,
+            dataset_size=args.eval_size,
+            seed=args.seed + 10_000,
+            code_length=args.needle_code_length,
+            min_gap=args.needle_min_gap,
+        )
+        train_dataset = ByteNeedleRecallDataset(train_bytes, train_config)
+        eval_dataset = ByteNeedleRecallDataset(eval_bytes, eval_config)
     train_loader = make_byte_loader(
-        ByteLanguageModelingDataset(train_bytes, train_config),
+        train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
     )
     eval_loader = make_byte_loader(
-        ByteLanguageModelingDataset(eval_bytes, eval_config),
+        eval_dataset,
         batch_size=args.batch_size,
         shuffle=False,
     )
@@ -132,6 +163,8 @@ def main() -> None:
             superblock_size_blocks=4,
             superblock_hit_buckets=(2, 4),
             vectorized_routing=not args.no_vectorized_routing,
+            routed_span_left=args.routed_span_left,
+            routed_span_right=args.routed_span_right,
         )
     model = TinyTransformerLM(
         vocab_size=BYTE_LM_VOCAB_SIZE,
@@ -166,9 +199,14 @@ def main() -> None:
             {
                 "phase": "start",
                 "attention": args.attention,
+                "task": args.task,
                 "byte_mode": args.byte_mode,
                 "byte_mixer_kernel": args.byte_mixer_kernel,
                 "byte_route_patch_size": args.byte_route_patch_size,
+                "routed_span_left": args.routed_span_left if args.attention == "uabla" else None,
+                "routed_span_right": args.routed_span_right if args.attention == "uabla" else None,
+                "needle_code_length": args.needle_code_length if args.task == "needle" else None,
+                "needle_min_gap": args.needle_min_gap if args.task == "needle" else None,
                 "steps": args.steps,
                 "batch_size": args.batch_size,
                 "effective_batch_size": args.batch_size * args.grad_accum_steps,
@@ -181,6 +219,10 @@ def main() -> None:
                 "amp": args.amp,
                 "amp_dtype": args.amp_dtype,
                 "grad_accum_steps": args.grad_accum_steps,
+                "lm_loss_weight": args.lm_loss_weight,
+                "answer_loss_weight": args.answer_loss_weight,
+                "diagnostics_every": args.diagnostics_every,
+                "eval_diagnostics": not args.no_eval_diagnostics,
                 "log_every": args.log_every,
             },
             sort_keys=True,
@@ -197,6 +239,9 @@ def main() -> None:
         device=device,
         amp=args.amp,
         amp_dtype=amp_dtype_from_arg(args.amp_dtype),
+        lm_loss_weight=args.lm_loss_weight,
+        answer_loss_weight=args.answer_loss_weight,
+        diagnostics_every=args.diagnostics_every,
         grad_accum_steps=args.grad_accum_steps,
         log_every=args.log_every,
         metrics_callback=emit_train_metrics,
@@ -209,6 +254,7 @@ def main() -> None:
         batches=args.eval_batches,
         amp=args.amp,
         amp_dtype=amp_dtype_from_arg(args.amp_dtype),
+        collect_diagnostics=not args.no_eval_diagnostics,
     )
     print(json.dumps({"phase": "eval", **eval_metrics.__dict__}, sort_keys=True), flush=True)
 

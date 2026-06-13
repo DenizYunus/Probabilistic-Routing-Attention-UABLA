@@ -8,6 +8,10 @@ from uabla.byte_lm import (
     BYTE_LM_VOCAB_SIZE,
     ByteLMConfig,
     ByteLanguageModelingDataset,
+    ByteNeedleRecallConfig,
+    ByteNeedleRecallDataset,
+    byte_answer_accuracy,
+    byte_answer_cross_entropy,
     bytes_to_ids,
     ensure_min_bytes,
     evaluate_byte_lm,
@@ -35,6 +39,64 @@ def test_byte_dataset_returns_shifted_next_byte_labels() -> None:
 
     assert ids_to_bytes(sample["input_ids"]) == b"abc"
     assert ids_to_bytes(sample["labels"]) == b"bcd"
+
+
+def test_byte_needle_dataset_places_answer_after_gap() -> None:
+    config = ByteNeedleRecallConfig(
+        seq_len=96,
+        dataset_size=2,
+        seed=123,
+        code_length=4,
+        min_gap=24,
+    )
+    dataset = ByteNeedleRecallDataset(bytes_to_ids(ensure_min_bytes(b"story text ", 256)), config)
+
+    sample = dataset[0]
+
+    assert sample["input_ids"].shape == (config.seq_len,)
+    assert sample["labels"].shape == (config.seq_len,)
+    assert sample["answer_index"].shape == (config.code_length,)
+    assert sample["answer_token"].shape == (config.code_length,)
+    assert sample["answer_source_index"].shape == (config.code_length,)
+    assert int(sample["needle_gap"].item()) >= config.min_gap
+    for answer_idx, answer_token in zip(
+        sample["answer_index"].tolist(),
+        sample["answer_token"].tolist(),
+        strict=True,
+    ):
+        assert int(sample["labels"][answer_idx].item()) == answer_token
+
+
+def test_byte_answer_metrics_use_answer_positions() -> None:
+    config = ByteNeedleRecallConfig(
+        seq_len=96,
+        dataset_size=2,
+        seed=123,
+        code_length=4,
+        min_gap=24,
+    )
+    dataset = ByteNeedleRecallDataset(bytes_to_ids(ensure_min_bytes(b"story text ", 256)), config)
+    batch = {
+        key: torch.stack([dataset[idx][key] for idx in range(2)])
+        for key in [
+            "input_ids",
+            "labels",
+            "answer_index",
+            "answer_token",
+            "answer_source_index",
+            "needle_gap",
+            "answer_random_chance",
+        ]
+    }
+    logits = torch.zeros(2, config.seq_len, BYTE_LM_VOCAB_SIZE)
+    batch_indices = torch.arange(2).view(2, 1).expand_as(batch["answer_index"])
+    logits[batch_indices, batch["answer_index"], batch["answer_token"]] = 10.0
+
+    loss = byte_answer_cross_entropy(logits, batch)
+    accuracy = byte_answer_accuracy(logits, batch)
+
+    assert loss.item() < 0.02
+    assert accuracy.item() == 1.0
 
 
 def test_byte_stream_helpers_repeat_and_split() -> None:
@@ -92,3 +154,51 @@ def test_train_and_evaluate_one_tiny_byte_lm_step() -> None:
     assert 0.0 <= metrics.byte_accuracy <= 1.0
     assert metrics.byte_perplexity > 0
     assert metrics.cache_dim_per_token_per_layer == 2 * model.hidden_size
+
+
+def test_train_and_evaluate_one_tiny_needle_step() -> None:
+    torch.manual_seed(9)
+    byte_ids = bytes_to_ids(ensure_min_bytes(b"needle story text ", min_length=256))
+    train_ids, eval_ids = split_byte_stream(byte_ids, seq_len=96, eval_fraction=0.25)
+    loader = make_byte_loader(
+        ByteNeedleRecallDataset(
+            train_ids,
+            ByteNeedleRecallConfig(seq_len=96, dataset_size=4, seed=9, code_length=4, min_gap=24),
+        ),
+        batch_size=2,
+        shuffle=False,
+    )
+    eval_loader = make_byte_loader(
+        ByteNeedleRecallDataset(
+            eval_ids,
+            ByteNeedleRecallConfig(seq_len=96, dataset_size=4, seed=19, code_length=4, min_gap=24),
+        ),
+        batch_size=2,
+        shuffle=False,
+    )
+    model = TinyTransformerLM(
+        vocab_size=BYTE_LM_VOCAB_SIZE,
+        max_seq_len=96,
+        hidden_size=16,
+        num_layers=1,
+        attention_type="dense",
+        input_mixer_kernel=3,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    history = train_byte_lm_steps(
+        model,
+        loader,
+        steps=1,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        lm_loss_weight=0.2,
+        answer_loss_weight=1.0,
+        log_every=1,
+    )
+    metrics = evaluate_byte_lm(model, eval_loader, device=torch.device("cpu"), batches=1)
+
+    assert len(history) == 1
+    assert history[0].answer_loss is not None
+    assert metrics.answer_accuracy is not None
+    assert 0.0 <= metrics.answer_accuracy <= 1.0

@@ -40,6 +40,8 @@ class UABLAConfig:
     memory_importance_score_scale: float = 0.25
     hybrid_score_rank: int = 16
     hybrid_score_scale: float = 0.1
+    routed_span_left: int = 0
+    routed_span_right: int = 0
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:
@@ -92,6 +94,10 @@ class UABLAConfig:
             raise ValueError("hybrid_score_rank cannot be negative")
         if self.hybrid_score_scale < 0:
             raise ValueError("hybrid_score_scale cannot be negative")
+        if self.routed_span_left < 0:
+            raise ValueError("routed_span_left cannot be negative")
+        if self.routed_span_right < 0:
+            raise ValueError("routed_span_right cannot be negative")
 
     @property
     def cache_dim(self) -> int:

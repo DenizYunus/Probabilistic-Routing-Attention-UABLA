@@ -199,6 +199,12 @@ class UABLAAttention(nn.Module):
         hard_token_mask = torch.zeros_like(candidates.mask)
         hard_token_mask.scatter_(dim=2, index=top_positions, src=token_budget_mask)
         hard_token_mask = hard_token_mask & candidates.mask
+        hard_token_mask = self._expand_hard_token_spans(
+            hard_token_mask,
+            candidates.indices,
+            candidates.mask,
+            seq_len,
+        )
 
         hard_scores = scores.masked_fill(~hard_token_mask, torch.finfo(scores.dtype).min)
         attn_hard = torch.softmax(hard_scores, dim=-1)
@@ -275,3 +281,43 @@ class UABLAAttention(nn.Module):
         distances = (positions - candidate_indices.clamp_min(0)).clamp_min(0)
         buckets = distances.clamp_max(self.config.max_position_buckets - 1)
         return self.rel_pos_bias(buckets).squeeze(-1)
+
+    def _expand_hard_token_spans(
+        self,
+        hard_token_mask: torch.Tensor,
+        candidate_indices: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        left = self.config.routed_span_left
+        right = self.config.routed_span_right
+        if left == 0 and right == 0:
+            return hard_token_mask
+        batch, query_len, _ = candidate_indices.shape
+        selected_indices = candidate_indices.masked_fill(~hard_token_mask, 0)
+        offsets = torch.arange(-left, right + 1, device=candidate_indices.device)
+        span_indices = selected_indices.unsqueeze(-1) + offsets.view(1, 1, 1, -1)
+        query_positions = torch.arange(query_len, device=candidate_indices.device).view(
+            1,
+            query_len,
+            1,
+            1,
+        )
+        span_valid = (
+            hard_token_mask.unsqueeze(-1)
+            & (span_indices >= 0)
+            & (span_indices < seq_len)
+            & (span_indices <= query_positions)
+        )
+        span_indices = span_indices.clamp(min=0, max=max(seq_len - 1, 0))
+
+        position_mask = torch.zeros(
+            batch,
+            query_len,
+            seq_len,
+            device=candidate_indices.device,
+            dtype=torch.bool,
+        )
+        position_mask.scatter_(dim=2, index=span_indices.reshape(batch, query_len, -1), src=span_valid.reshape(batch, query_len, -1))
+        expanded = torch.gather(position_mask, dim=2, index=candidate_indices.clamp_min(0))
+        return (hard_token_mask | expanded) & candidate_mask

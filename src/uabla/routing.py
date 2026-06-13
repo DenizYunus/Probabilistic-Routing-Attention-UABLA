@@ -628,19 +628,57 @@ def _routed_block_candidate_indices(
     return indices.clamp(max=max(seq_len - 1, 0)), mask
 
 
+def _expand_candidate_spans(
+    indices: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    seq_len: int,
+    left: int,
+    right: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if left < 0 or right < 0:
+        raise ValueError("span expansion values cannot be negative")
+    if left == 0 and right == 0:
+        return indices, mask
+    device = indices.device
+    offsets = torch.arange(-left, right + 1, device=device)
+    expanded = indices.unsqueeze(-1) + offsets.view(*((1,) * indices.ndim), offsets.numel())
+    expanded = expanded.reshape(*indices.shape[:-1], indices.shape[-1] * offsets.numel())
+    expanded_mask = mask.unsqueeze(-1).expand(
+        *mask.shape,
+        offsets.numel(),
+    ).reshape_as(expanded)
+    query_len = indices.shape[1]
+    token_positions = torch.arange(query_len, device=device).view(1, query_len, 1)
+    expanded_mask = expanded_mask & (expanded >= 0) & (expanded < seq_len) & (expanded <= token_positions)
+    return expanded.clamp(min=0, max=max(seq_len - 1, 0)), expanded_mask
+
+
 def _mask_duplicate_candidates(
     indices: torch.Tensor,
     mask: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    order = torch.arange(indices.shape[-1], device=indices.device)
-    duplicate = (
-        (indices.unsqueeze(-1) == indices.unsqueeze(-2))
-        & mask.unsqueeze(-1)
-        & mask.unsqueeze(-2)
+    candidate_count = indices.shape[-1]
+    order = torch.arange(candidate_count, device=indices.device).view(
+        *((1,) * (indices.ndim - 1)),
+        candidate_count,
     )
-    earlier = order.view(1, 1, 1, -1) < order.view(1, 1, -1, 1)
-    has_earlier = (duplicate & earlier).any(dim=-1)
-    return indices, mask & ~has_earlier
+    safe_indices = indices.clamp_min(0)
+    invalid_index = safe_indices.amax(dim=-1, keepdim=True) + 1
+    safe_indices = torch.where(mask, safe_indices, invalid_index)
+    sort_key = safe_indices * (candidate_count + 1) + order
+    _, sorted_positions = sort_key.sort(dim=-1)
+    sorted_indices = torch.gather(indices, dim=-1, index=sorted_positions)
+    sorted_mask = torch.gather(mask, dim=-1, index=sorted_positions)
+
+    previous_same = sorted_indices[..., 1:] == sorted_indices[..., :-1]
+    previous_valid = sorted_mask[..., 1:] & sorted_mask[..., :-1]
+    duplicate_sorted = torch.zeros_like(sorted_mask)
+    duplicate_sorted[..., 1:] = previous_same & previous_valid
+
+    duplicate = torch.zeros_like(mask)
+    duplicate.scatter_(dim=-1, index=sorted_positions, src=duplicate_sorted)
+    return indices, mask & ~duplicate
 
 
 def _select_block_pool(
