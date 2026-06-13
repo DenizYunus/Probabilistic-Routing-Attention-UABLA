@@ -9,6 +9,8 @@ def test_default_cache_dim_is_locked_to_448() -> None:
     config = UABLAConfig(hidden_size=7168)
 
     assert config.centroids_per_block == 4
+    assert config.routed_span_left == 2
+    assert config.routed_span_right == 8
     assert config.cache_dim == 448
 
 

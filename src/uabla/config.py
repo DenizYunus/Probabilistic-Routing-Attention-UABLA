@@ -40,8 +40,8 @@ class UABLAConfig:
     memory_importance_score_scale: float = 0.25
     hybrid_score_rank: int = 16
     hybrid_score_scale: float = 0.1
-    routed_span_left: int = 0
-    routed_span_right: int = 0
+    routed_span_left: int = 2
+    routed_span_right: int = 8
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:

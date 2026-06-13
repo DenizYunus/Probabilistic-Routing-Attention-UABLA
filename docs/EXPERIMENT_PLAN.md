@@ -343,8 +343,8 @@ PYTHONPATH=src python scripts/run_byte_lm.py \
   --layers 4 \
   --byte-mixer-kernel 5 \
   --byte-route-patch-size 16 \
-  --routed-span-left 4 \
-  --routed-span-right 12 \
+  --routed-span-left 2 \
+  --routed-span-right 8 \
   --lm-loss-weight 0.2 \
   --answer-loss-weight 5.0 \
   --diagnostics-every 500 \

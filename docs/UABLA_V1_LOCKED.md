@@ -32,15 +32,16 @@ to reduce cache memory and long-context attention compute.
 3. Use multiscale four-centroid superblock routing before block routing.
 4. Route against block centroids after superblock narrowing.
 5. Open deduplicated dense parent blocks after centroid routing.
-6. Always include a local causal window.
-7. Use bucketed top-k, not true top-p, in V1.
-8. Use a cheap diagonal Gaussian distance plus optional low-rank hybrid scoring.
-9. Use straight-through differentiable sparse routing.
-10. Support training-only dense-attention teacher distillation.
-11. Keep memory importance within the existing 448-dim cache budget.
-12. Keep the implementation causal.
-13. Never materialize a full `T x T` distance matrix in serious paths.
-14. Treat this as an attention/cache research prototype, not a DeepSeek-scale training recipe.
+6. Expand selected routed tokens with a causal successor-biased byte span.
+7. Always include a local causal window.
+8. Use bucketed top-k, not true top-p, in V1.
+9. Use a cheap diagonal Gaussian distance plus optional low-rank hybrid scoring.
+10. Use straight-through differentiable sparse routing.
+11. Support training-only dense-attention teacher distillation.
+12. Keep memory importance within the existing 448-dim cache budget.
+13. Keep the implementation causal.
+14. Never materialize a full `T x T` distance matrix in serious paths.
+15. Treat this as an attention/cache research prototype, not a DeepSeek-scale training recipe.
 
 ## Locked Dimensions
 
@@ -234,6 +235,18 @@ Token-selection budget:
 ```text
 token_k_buckets = [16, 32, 64, 128]
 ```
+
+Routed token span expansion:
+
+```text
+routed_span_left = 2
+routed_span_right = 8
+```
+
+After hard token selection, V1 opens a small causal span around selected routed
+positions before the final attention softmax. The successor bias helps
+byte-level copy tasks when the router lands inside a word or code rather than
+on the exact first byte. This span does not add cache memory.
 
 The bucket index is chosen from query uncertainty:
 
