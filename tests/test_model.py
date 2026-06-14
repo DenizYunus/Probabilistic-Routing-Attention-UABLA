@@ -97,3 +97,35 @@ def test_input_mixer_preserves_tiny_model_shape() -> None:
     output = model(input_ids)
 
     assert output.logits.shape == (2, seq_len, vocab_size)
+
+
+def test_uabla_shifted_blocks_can_be_toggled() -> None:
+    config = UABLAConfig(
+        hidden_size=16,
+        routing_dim=8,
+        value_dim=12,
+        position_dim=4,
+        block_size=4,
+        local_window=4,
+        centroid_hit_buckets=(4, 8),
+        token_k_buckets=(2, 4),
+        superblock_size_blocks=2,
+        superblock_hit_buckets=(2, 4),
+        use_shifted_blocks=False,
+    )
+    model = TinyTransformerLM(
+        vocab_size=32,
+        max_seq_len=15,
+        hidden_size=16,
+        num_layers=2,
+        attention_type="uabla",
+        local_window=4,
+        uabla_config=config,
+    )
+
+    model.set_uabla_shifted_blocks(True)
+
+    assert model.uabla_config is not None
+    assert model.uabla_config.use_shifted_blocks
+    for block in model.blocks:
+        assert block.attention.config.use_shifted_blocks

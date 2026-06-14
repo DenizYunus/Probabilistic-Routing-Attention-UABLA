@@ -24,6 +24,7 @@ from .experiment import (
     language_model_loss,
     move_batch,
 )
+from .losses import route_entropy_floor_loss
 from .model import TinyTransformerLM
 
 BYTE_PAD_TOKEN = 256
@@ -91,6 +92,22 @@ class ByteLMMetrics:
     cache_dim_per_token_per_layer: int
     peak_memory_mb: float | None
     diagnostics: dict[str, float]
+
+
+@dataclass(frozen=True)
+class RoutingBudgetStage:
+    start_step: int
+    superblock_hit_buckets: tuple[int, ...] | None
+    centroid_hit_buckets: tuple[int, ...]
+    token_k_buckets: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if self.start_step <= 0:
+            raise ValueError("budget stage start_step must be positive")
+        _validate_budget_buckets(self.centroid_hit_buckets, "centroid_hit_buckets")
+        _validate_budget_buckets(self.token_k_buckets, "token_k_buckets")
+        if self.superblock_hit_buckets is not None:
+            _validate_budget_buckets(self.superblock_hit_buckets, "superblock_hit_buckets")
 
 
 NEEDLE_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
@@ -311,6 +328,14 @@ def train_byte_lm_steps(
     answer_loss_weight: float = 0.0,
     diagnostics_every: int = 0,
     log_every: int = 10,
+    shifted_enable_step: int | None = None,
+    shifted_enable_answer_accuracy: float | None = None,
+    route_budget_stages: tuple[RoutingBudgetStage, ...] = (),
+    route_entropy_weight: float = 0.0,
+    route_entropy_min: float = 0.35,
+    route_entropy_warmup_steps: int = 0,
+    route_entropy_decay_steps: int = 0,
+    stage_callback: Callable[[dict[str, object]], None] | None = None,
     metrics_callback: Callable[[ByteLMMetrics], None] | None = None,
 ) -> list[ByteLMMetrics]:
     if torch is None:
@@ -319,6 +344,28 @@ def train_byte_lm_steps(
         raise ValueError("grad_accum_steps must be positive")
     if diagnostics_every < 0:
         raise ValueError("diagnostics_every cannot be negative")
+    if shifted_enable_step is not None:
+        if shifted_enable_step < 0:
+            raise ValueError("shifted_enable_step cannot be negative")
+        if model.attention_type != "uabla":
+            raise ValueError("shifted routing stages require UABLA attention")
+        model.set_uabla_shifted_blocks(False)
+    if shifted_enable_answer_accuracy is not None:
+        if not 0.0 <= shifted_enable_answer_accuracy <= 1.0:
+            raise ValueError("shifted_enable_answer_accuracy must be in [0, 1]")
+        if model.attention_type != "uabla":
+            raise ValueError("shifted routing stages require UABLA attention")
+        model.set_uabla_shifted_blocks(False)
+    if route_budget_stages:
+        if model.attention_type != "uabla":
+            raise ValueError("route budget curriculum requires UABLA attention")
+        route_budget_stages = tuple(sorted(route_budget_stages, key=lambda stage: stage.start_step))
+    if route_entropy_weight < 0:
+        raise ValueError("route_entropy_weight cannot be negative")
+    if not 0.0 <= route_entropy_min <= 1.0:
+        raise ValueError("route_entropy_min must be in [0, 1]")
+    if route_entropy_warmup_steps < 0 or route_entropy_decay_steps < 0:
+        raise ValueError("route entropy schedule steps must be non-negative")
     if amp_dtype is None:
         amp_dtype = torch.float16
     model.train()
@@ -330,7 +377,63 @@ def train_byte_lm_steps(
     metrics: list[ByteLMMetrics] = []
     start_time = time.perf_counter()
     token_count = 0
+    shifted_stage_enabled = shifted_enable_step is None and shifted_enable_answer_accuracy is None
+    budget_stage_index = -1
+
+    def enable_shifted_stage(event: dict[str, object]) -> None:
+        nonlocal shifted_stage_enabled
+        model.set_uabla_shifted_blocks(True)
+        shifted_stage_enabled = True
+        if stage_callback is not None:
+            stage_callback(
+                {
+                    "event": "enable_shifted_routing",
+                    "shifted_routing_blocks": True,
+                    **event,
+                }
+            )
+
+    def apply_budget_stage(stage_index: int, step: int) -> None:
+        stage = route_budget_stages[stage_index]
+        model.set_uabla_budget_buckets(
+            superblock_hit_buckets=stage.superblock_hit_buckets,
+            centroid_hit_buckets=stage.centroid_hit_buckets,
+            token_k_buckets=stage.token_k_buckets,
+        )
+        if stage_callback is not None:
+            stage_callback(
+                {
+                    "centroid_hit_buckets": list(stage.centroid_hit_buckets),
+                    "event": "set_route_budget_stage",
+                    "stage_index": stage_index,
+                    "step": step,
+                    "superblock_hit_buckets": (
+                        list(stage.superblock_hit_buckets)
+                        if stage.superblock_hit_buckets is not None
+                        else None
+                    ),
+                    "token_k_buckets": list(stage.token_k_buckets),
+                }
+            )
+
     for step in range(1, steps + 1):
+        if route_budget_stages:
+            next_budget_stage_index = _budget_stage_index_for_step(route_budget_stages, step)
+            if next_budget_stage_index != budget_stage_index:
+                budget_stage_index = next_budget_stage_index
+                apply_budget_stage(budget_stage_index, step)
+        if (
+            shifted_enable_step is not None
+            and not shifted_stage_enabled
+            and step > shifted_enable_step
+        ):
+            enable_shifted_stage({"reason": "fixed_step", "step": step})
+        current_route_entropy_weight = _scheduled_aux_weight(
+            route_entropy_weight,
+            step=step,
+            warmup_steps=route_entropy_warmup_steps,
+            decay_steps=route_entropy_decay_steps,
+        )
         optimizer.zero_grad(set_to_none=True)
         last_batch = None
         last_logits = None
@@ -340,9 +443,10 @@ def train_byte_lm_steps(
         for _ in range(grad_accum_steps):
             batch = move_batch(next(stream), device)
             with _autocast_context(device, enabled=amp, dtype=amp_dtype):
+                needs_routing = model.attention_type == "uabla" and current_route_entropy_weight > 0
                 output = model(
                     batch["input_ids"],
-                    return_routing=False,
+                    return_routing=needs_routing,
                     return_attention=False,
                 )
                 lm_loss = language_model_loss(output.logits, batch["labels"])
@@ -352,6 +456,15 @@ def train_byte_lm_steps(
                     answer_loss = byte_answer_cross_entropy(output.logits, batch)
                     if answer_loss_weight > 0:
                         loss = loss + answer_loss_weight * answer_loss
+                if current_route_entropy_weight > 0 and output.uabla_outputs:
+                    entropy_losses = _route_entropy_losses_from_output(
+                        output,
+                        min_normalized_entropy=route_entropy_min,
+                    )
+                    if entropy_losses:
+                        loss = loss + current_route_entropy_weight * torch.stack(
+                            entropy_losses,
+                        ).mean()
             scaler.scale(loss / grad_accum_steps).backward()
             token_count += batch["input_ids"].numel()
             last_batch = batch
@@ -393,6 +506,21 @@ def train_byte_lm_steps(
             )
             if metrics_callback is not None:
                 metrics_callback(metrics[-1])
+            if (
+                shifted_enable_answer_accuracy is not None
+                and not shifted_stage_enabled
+                and step < steps
+                and metrics[-1].answer_accuracy is not None
+                and metrics[-1].answer_accuracy >= shifted_enable_answer_accuracy
+            ):
+                enable_shifted_stage(
+                    {
+                        "answer_accuracy": metrics[-1].answer_accuracy,
+                        "reason": "answer_accuracy_threshold",
+                        "step": step + 1,
+                        "trigger_step": step,
+                    }
+                )
     return metrics
 
 
@@ -580,6 +708,91 @@ def _diagnostic_forward(
     finally:
         if was_training:
             model.train()
+
+
+def _route_entropy_losses_from_output(
+    output,
+    *,
+    min_normalized_entropy: float,
+) -> list[torch.Tensor]:
+    losses: list[torch.Tensor] = []
+    for layer in output.uabla_outputs:
+        if layer.route_scores is not None and layer.routeable_mask is not None:
+            losses.append(
+                route_entropy_floor_loss(
+                    layer.route_scores,
+                    layer.routeable_mask,
+                    min_normalized_entropy=min_normalized_entropy,
+                )
+            )
+        if layer.superblock_route_scores is not None and layer.superblock_routeable_mask is not None:
+            losses.append(
+                route_entropy_floor_loss(
+                    layer.superblock_route_scores,
+                    layer.superblock_routeable_mask,
+                    min_normalized_entropy=min_normalized_entropy,
+                )
+            )
+        if layer.shifted_route_scores is not None and layer.shifted_routeable_mask is not None:
+            losses.append(
+                route_entropy_floor_loss(
+                    layer.shifted_route_scores,
+                    layer.shifted_routeable_mask,
+                    min_normalized_entropy=min_normalized_entropy,
+                )
+            )
+        if (
+            layer.shifted_superblock_route_scores is not None
+            and layer.shifted_superblock_routeable_mask is not None
+        ):
+            losses.append(
+                route_entropy_floor_loss(
+                    layer.shifted_superblock_route_scores,
+                    layer.shifted_superblock_routeable_mask,
+                    min_normalized_entropy=min_normalized_entropy,
+                )
+            )
+    return losses
+
+
+def _budget_stage_index_for_step(
+    stages: tuple[RoutingBudgetStage, ...],
+    step: int,
+) -> int:
+    stage_index = 0
+    for index, stage in enumerate(stages):
+        if stage.start_step <= step:
+            stage_index = index
+        else:
+            break
+    return stage_index
+
+
+def _validate_budget_buckets(values: tuple[int, ...], name: str) -> None:
+    if not values:
+        raise ValueError(f"{name} cannot be empty")
+    if any(value <= 0 for value in values):
+        raise ValueError(f"{name} must be positive")
+    if tuple(sorted(values)) != values:
+        raise ValueError(f"{name} must be sorted ascending")
+
+
+def _scheduled_aux_weight(
+    weight: float,
+    *,
+    step: int,
+    warmup_steps: int,
+    decay_steps: int,
+) -> float:
+    if weight <= 0:
+        return 0.0
+    factor = 1.0
+    if warmup_steps > 0:
+        factor *= min(1.0, step / float(warmup_steps))
+    if decay_steps > 0 and step > warmup_steps:
+        decay_progress = (step - warmup_steps) / float(decay_steps)
+        factor *= max(0.0, 1.0 - decay_progress)
+    return weight * factor
 
 
 def _safe_perplexity(loss: float) -> float:

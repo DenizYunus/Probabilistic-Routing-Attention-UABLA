@@ -19,6 +19,7 @@ from uabla.byte_lm import (
     ByteLanguageModelingDataset,
     ByteNeedleRecallConfig,
     ByteNeedleRecallDataset,
+    RoutingBudgetStage,
     bytes_to_ids,
     ensure_min_bytes,
     evaluate_byte_lm,
@@ -78,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--routed-span-right", type=int, default=8)
     parser.add_argument("--no-shifted-routing-blocks", action="store_true")
     parser.add_argument("--shifted-block-offset", type=int)
+    parser.add_argument("--stage-shifted-after-steps", type=int)
+    parser.add_argument("--stage-shifted-when-answer-accuracy", type=float)
     parser.add_argument("--needle-code-length", type=int, default=12)
     parser.add_argument("--needle-min-gap", type=int, default=768)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -90,6 +93,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lm-loss-weight", type=float, default=1.0)
     parser.add_argument("--answer-loss-weight", type=float, default=0.0)
     parser.add_argument("--no-vectorized-routing", action="store_true")
+    parser.add_argument("--route-budget-curriculum", choices=["none", "explore"], default="none")
+    parser.add_argument("--route-budget-curriculum-boundaries", default="2500,6500")
+    parser.add_argument("--route-entropy-weight", type=float, default=0.0)
+    parser.add_argument("--route-entropy-min", type=float, default=0.35)
+    parser.add_argument("--route-entropy-warmup-steps", type=int, default=0)
+    parser.add_argument("--route-entropy-decay-steps", type=int, default=0)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="float16")
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -98,8 +107,92 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def build_route_budget_stages(args: argparse.Namespace) -> tuple[RoutingBudgetStage, ...]:
+    if args.route_budget_curriculum == "none":
+        return ()
+    if args.route_budget_curriculum != "explore":
+        raise ValueError(f"unknown route budget curriculum: {args.route_budget_curriculum}")
+
+    boundaries = parse_curriculum_boundaries(args.route_budget_curriculum_boundaries)
+    first_medium_step = boundaries[0] + 1
+    first_final_step = boundaries[1] + 1
+    return (
+        RoutingBudgetStage(
+            start_step=1,
+            superblock_hit_buckets=(4, 8),
+            centroid_hit_buckets=(16, 32),
+            token_k_buckets=(32, 64),
+        ),
+        RoutingBudgetStage(
+            start_step=first_medium_step,
+            superblock_hit_buckets=(2, 4),
+            centroid_hit_buckets=(8, 16),
+            token_k_buckets=(16, 32),
+        ),
+        RoutingBudgetStage(
+            start_step=first_final_step,
+            superblock_hit_buckets=(2, 4),
+            centroid_hit_buckets=(4, 8),
+            token_k_buckets=(8, 16),
+        ),
+    )
+
+
+def parse_curriculum_boundaries(value: str) -> tuple[int, int]:
+    try:
+        parts = [int(part.strip()) for part in value.split(",")]
+    except ValueError as exc:
+        raise ValueError("--route-budget-curriculum-boundaries must be two integers") from exc
+    if len(parts) != 2:
+        raise ValueError("--route-budget-curriculum-boundaries must contain two comma-separated steps")
+    if parts[0] <= 0 or parts[1] <= 0:
+        raise ValueError("route budget curriculum boundaries must be positive")
+    if parts[0] >= parts[1]:
+        raise ValueError("route budget curriculum boundaries must be strictly increasing")
+    return parts[0], parts[1]
+
+
+def budget_stage_to_json(stage: RoutingBudgetStage) -> dict[str, Any]:
+    return {
+        "centroid_hit_buckets": list(stage.centroid_hit_buckets),
+        "start_step": stage.start_step,
+        "superblock_hit_buckets": (
+            list(stage.superblock_hit_buckets) if stage.superblock_hit_buckets is not None else None
+        ),
+        "token_k_buckets": list(stage.token_k_buckets),
+    }
+
+
 def main() -> None:
     args = parse_args()
+    budget_stages = build_route_budget_stages(args)
+    stage_shifted = (
+        args.stage_shifted_after_steps is not None
+        or args.stage_shifted_when_answer_accuracy is not None
+    )
+    if stage_shifted:
+        if args.attention != "uabla":
+            raise ValueError("shifted routing stages require --attention uabla")
+        if args.no_shifted_routing_blocks:
+            raise ValueError("shifted routing stages conflict with --no-shifted-routing-blocks")
+    if args.stage_shifted_after_steps is not None:
+        if args.stage_shifted_after_steps < 0:
+            raise ValueError("--stage-shifted-after-steps cannot be negative")
+        if args.stage_shifted_after_steps >= args.steps:
+            raise ValueError("--stage-shifted-after-steps must be smaller than --steps")
+    if args.stage_shifted_when_answer_accuracy is not None:
+        if not 0.0 <= args.stage_shifted_when_answer_accuracy <= 1.0:
+            raise ValueError("--stage-shifted-when-answer-accuracy must be in [0, 1]")
+    if budget_stages and args.attention != "uabla":
+        raise ValueError("--route-budget-curriculum requires --attention uabla")
+    if args.route_entropy_weight < 0:
+        raise ValueError("--route-entropy-weight cannot be negative")
+    if args.route_entropy_weight > 0 and args.attention != "uabla":
+        raise ValueError("--route-entropy-weight requires --attention uabla")
+    if not 0.0 <= args.route_entropy_min <= 1.0:
+        raise ValueError("--route-entropy-min must be in [0, 1]")
+    if args.route_entropy_warmup_steps < 0 or args.route_entropy_decay_steps < 0:
+        raise ValueError("route entropy schedule steps must be non-negative")
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
@@ -168,7 +261,7 @@ def main() -> None:
             vectorized_routing=not args.no_vectorized_routing,
             routed_span_left=args.routed_span_left,
             routed_span_right=args.routed_span_right,
-            use_shifted_blocks=not args.no_shifted_routing_blocks,
+            use_shifted_blocks=False if stage_shifted else not args.no_shifted_routing_blocks,
             shifted_block_offset=args.shifted_block_offset,
         )
     model = TinyTransformerLM(
@@ -204,6 +297,9 @@ def main() -> None:
             flush=True,
         )
 
+    def emit_stage_event(event: dict[str, object]) -> None:
+        print(json.dumps({"phase": "stage", **event}, sort_keys=True), flush=True)
+
     print(
         json.dumps(
             {
@@ -218,11 +314,17 @@ def main() -> None:
                 "shifted_routing_blocks": (
                     not args.no_shifted_routing_blocks if args.attention == "uabla" else None
                 ),
+                "shifted_routing_blocks_initial": (
+                    uabla_config.use_shifted_blocks if uabla_config is not None else None
+                ),
                 "shifted_block_offset": (
                     uabla_config.shifted_block_offset_value
-                    if uabla_config is not None and uabla_config.use_shifted_blocks
+                    if uabla_config is not None
+                    and (uabla_config.use_shifted_blocks or stage_shifted)
                     else None
                 ),
+                "stage_shifted_after_steps": args.stage_shifted_after_steps,
+                "stage_shifted_when_answer_accuracy": args.stage_shifted_when_answer_accuracy,
                 "needle_code_length": args.needle_code_length if args.task == "needle" else None,
                 "needle_min_gap": args.needle_min_gap if args.task == "needle" else None,
                 "steps": args.steps,
@@ -245,6 +347,13 @@ def main() -> None:
                 "diagnostics_every": args.diagnostics_every,
                 "eval_diagnostics": not args.no_eval_diagnostics,
                 "log_every": args.log_every,
+                "route_budget_curriculum": args.route_budget_curriculum,
+                "route_budget_curriculum_boundaries": args.route_budget_curriculum_boundaries,
+                "route_budget_stages": [budget_stage_to_json(stage) for stage in budget_stages],
+                "route_entropy_decay_steps": args.route_entropy_decay_steps,
+                "route_entropy_min": args.route_entropy_min,
+                "route_entropy_warmup_steps": args.route_entropy_warmup_steps,
+                "route_entropy_weight": args.route_entropy_weight,
             },
             sort_keys=True,
         ),
@@ -265,6 +374,14 @@ def main() -> None:
         diagnostics_every=args.diagnostics_every,
         grad_accum_steps=args.grad_accum_steps,
         log_every=args.log_every,
+        shifted_enable_step=args.stage_shifted_after_steps,
+        shifted_enable_answer_accuracy=args.stage_shifted_when_answer_accuracy,
+        route_budget_stages=budget_stages,
+        route_entropy_weight=args.route_entropy_weight,
+        route_entropy_min=args.route_entropy_min,
+        route_entropy_warmup_steps=args.route_entropy_warmup_steps,
+        route_entropy_decay_steps=args.route_entropy_decay_steps,
+        stage_callback=emit_stage_event,
         metrics_callback=emit_train_metrics,
     )
 

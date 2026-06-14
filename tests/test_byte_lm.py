@@ -10,6 +10,7 @@ from uabla.byte_lm import (
     ByteLanguageModelingDataset,
     ByteNeedleRecallConfig,
     ByteNeedleRecallDataset,
+    RoutingBudgetStage,
     byte_answer_accuracy,
     byte_answer_cross_entropy,
     bytes_to_ids,
@@ -20,6 +21,7 @@ from uabla.byte_lm import (
     split_byte_stream,
     train_byte_lm_steps,
 )
+from uabla.config import UABLAConfig
 from uabla.model import TinyTransformerLM
 
 
@@ -202,3 +204,193 @@ def test_train_and_evaluate_one_tiny_needle_step() -> None:
     assert history[0].answer_loss is not None
     assert metrics.answer_accuracy is not None
     assert 0.0 <= metrics.answer_accuracy <= 1.0
+
+
+def test_stage_training_enables_shifted_routing() -> None:
+    torch.manual_seed(10)
+    byte_ids = bytes_to_ids(ensure_min_bytes(b"stage shifted byte test ", min_length=128))
+    train_ids, _ = split_byte_stream(byte_ids, seq_len=16, eval_fraction=0.25)
+    loader = make_byte_loader(
+        ByteLanguageModelingDataset(
+            train_ids,
+            ByteLMConfig(seq_len=16, dataset_size=4, seed=10),
+        ),
+        batch_size=2,
+        shuffle=False,
+    )
+    config = UABLAConfig(
+        hidden_size=16,
+        routing_dim=8,
+        value_dim=12,
+        position_dim=4,
+        block_size=4,
+        local_window=4,
+        centroid_hit_buckets=(4, 8),
+        token_k_buckets=(2, 4),
+        superblock_size_blocks=2,
+        superblock_hit_buckets=(2, 4),
+        use_shifted_blocks=True,
+    )
+    model = TinyTransformerLM(
+        vocab_size=BYTE_LM_VOCAB_SIZE,
+        max_seq_len=16,
+        hidden_size=16,
+        num_layers=1,
+        attention_type="uabla",
+        local_window=4,
+        uabla_config=config,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    events: list[dict[str, object]] = []
+
+    train_byte_lm_steps(
+        model,
+        loader,
+        steps=2,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        log_every=2,
+        shifted_enable_step=1,
+        stage_callback=events.append,
+    )
+
+    assert events == [
+        {
+            "event": "enable_shifted_routing",
+            "reason": "fixed_step",
+            "shifted_routing_blocks": True,
+            "step": 2,
+        }
+    ]
+    assert model.uabla_config is not None
+    assert model.uabla_config.use_shifted_blocks
+
+
+def test_stage_training_can_wait_for_answer_accuracy_threshold() -> None:
+    torch.manual_seed(11)
+    byte_ids = bytes_to_ids(ensure_min_bytes(b"adaptive shifted byte needle test ", min_length=256))
+    train_ids, _ = split_byte_stream(byte_ids, seq_len=96, eval_fraction=0.25)
+    loader = make_byte_loader(
+        ByteNeedleRecallDataset(
+            train_ids,
+            ByteNeedleRecallConfig(seq_len=96, dataset_size=4, seed=11, code_length=4, min_gap=24),
+        ),
+        batch_size=2,
+        shuffle=False,
+    )
+    config = UABLAConfig(
+        hidden_size=16,
+        routing_dim=8,
+        value_dim=12,
+        position_dim=4,
+        block_size=4,
+        local_window=4,
+        centroid_hit_buckets=(4, 8),
+        token_k_buckets=(2, 4),
+        superblock_size_blocks=2,
+        superblock_hit_buckets=(2, 4),
+        use_shifted_blocks=True,
+    )
+    model = TinyTransformerLM(
+        vocab_size=BYTE_LM_VOCAB_SIZE,
+        max_seq_len=96,
+        hidden_size=16,
+        num_layers=1,
+        attention_type="uabla",
+        local_window=4,
+        uabla_config=config,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    events: list[dict[str, object]] = []
+
+    train_byte_lm_steps(
+        model,
+        loader,
+        steps=2,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        lm_loss_weight=0.2,
+        answer_loss_weight=1.0,
+        log_every=1,
+        shifted_enable_answer_accuracy=0.0,
+        stage_callback=events.append,
+    )
+
+    assert events
+    assert events[0]["reason"] == "answer_accuracy_threshold"
+    assert events[0]["step"] == 2
+    assert events[0]["trigger_step"] == 1
+    assert model.uabla_config is not None
+    assert model.uabla_config.use_shifted_blocks
+
+
+def test_route_budget_curriculum_updates_buckets_during_training() -> None:
+    torch.manual_seed(12)
+    byte_ids = bytes_to_ids(ensure_min_bytes(b"budget curriculum byte test ", min_length=128))
+    train_ids, _ = split_byte_stream(byte_ids, seq_len=16, eval_fraction=0.25)
+    loader = make_byte_loader(
+        ByteLanguageModelingDataset(
+            train_ids,
+            ByteLMConfig(seq_len=16, dataset_size=4, seed=12),
+        ),
+        batch_size=2,
+        shuffle=False,
+    )
+    config = UABLAConfig(
+        hidden_size=16,
+        routing_dim=8,
+        value_dim=12,
+        position_dim=4,
+        block_size=4,
+        local_window=4,
+        centroid_hit_buckets=(4,),
+        token_k_buckets=(4,),
+        superblock_size_blocks=2,
+        superblock_hit_buckets=(2,),
+        use_shifted_blocks=False,
+    )
+    model = TinyTransformerLM(
+        vocab_size=BYTE_LM_VOCAB_SIZE,
+        max_seq_len=16,
+        hidden_size=16,
+        num_layers=1,
+        attention_type="uabla",
+        local_window=4,
+        uabla_config=config,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    events: list[dict[str, object]] = []
+
+    train_byte_lm_steps(
+        model,
+        loader,
+        steps=2,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        log_every=2,
+        route_budget_stages=(
+            RoutingBudgetStage(
+                start_step=1,
+                superblock_hit_buckets=(2,),
+                centroid_hit_buckets=(4,),
+                token_k_buckets=(4,),
+            ),
+            RoutingBudgetStage(
+                start_step=2,
+                superblock_hit_buckets=(2, 4),
+                centroid_hit_buckets=(4, 8),
+                token_k_buckets=(4, 8),
+            ),
+        ),
+        route_entropy_weight=0.01,
+        route_entropy_min=0.25,
+        stage_callback=events.append,
+    )
+
+    assert [event["event"] for event in events] == [
+        "set_route_budget_stage",
+        "set_route_budget_stage",
+    ]
+    assert model.uabla_config is not None
+    assert model.uabla_config.centroid_hit_buckets == (4, 8)
+    assert model.uabla_config.token_k_buckets == (4, 8)

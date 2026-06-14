@@ -8,6 +8,7 @@ from uabla import UABLAAttention, UABLAConfig
 from uabla.losses import (
     direct_routing_supervision_loss,
     guarded_budget_loss,
+    route_entropy_floor_loss,
     routing_diagnostics,
     routing_distillation_loss,
     token_contrastive_retrieval_loss,
@@ -77,6 +78,23 @@ def test_guarded_budget_loss_and_diagnostics_are_finite() -> None:
     assert torch.isfinite(budget_loss)
     assert diagnostics
     assert all(torch.isfinite(value) for value in diagnostics.values())
+
+
+def test_route_entropy_floor_loss_penalizes_collapsed_routes() -> None:
+    route_scores = torch.tensor([[[[10.0], [0.0], [0.0], [0.0]]]], requires_grad=True)
+    routeable_mask = torch.ones_like(route_scores, dtype=torch.bool)
+
+    loss = route_entropy_floor_loss(
+        route_scores,
+        routeable_mask,
+        min_normalized_entropy=0.5,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert loss.item() > 0
+    assert route_scores.grad is not None
+    assert route_scores.grad.abs().sum().item() > 0
 
 
 def test_direct_routing_supervision_loss_is_differentiable() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 try:
     import torch
@@ -280,3 +280,32 @@ class TinyTransformerLM(nn.Module):
                 raise RuntimeError("uabla_config missing")
             return self.uabla_config.cache_dim
         return 2 * self.hidden_size
+
+    def set_uabla_shifted_blocks(self, enabled: bool) -> None:
+        self.replace_uabla_config(use_shifted_blocks=enabled)
+
+    def set_uabla_budget_buckets(
+        self,
+        *,
+        superblock_hit_buckets: tuple[int, ...] | None = None,
+        centroid_hit_buckets: tuple[int, ...],
+        token_k_buckets: tuple[int, ...],
+    ) -> None:
+        changes = {
+            "centroid_hit_buckets": centroid_hit_buckets,
+            "token_k_buckets": token_k_buckets,
+        }
+        if superblock_hit_buckets is not None:
+            changes["superblock_hit_buckets"] = superblock_hit_buckets
+        self.replace_uabla_config(**changes)
+
+    def replace_uabla_config(self, **changes) -> None:
+        if self.attention_type != "uabla":
+            raise ValueError("UABLA config updates require UABLA attention")
+        if self.uabla_config is None:
+            raise RuntimeError("uabla_config missing")
+        uabla_config = replace(self.uabla_config, **changes)
+        self.uabla_config = uabla_config
+        for block in self.blocks:
+            if getattr(block, "attention_type", None) == "uabla":
+                block.attention.config = uabla_config

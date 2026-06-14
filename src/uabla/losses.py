@@ -245,6 +245,39 @@ def guarded_budget_loss(
     return (guard * budget_fraction).mean()
 
 
+def route_entropy_floor_loss(
+    route_scores: torch.Tensor,
+    routeable_mask: torch.Tensor,
+    *,
+    min_normalized_entropy: float,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Penalize route distributions that collapse before the router is useful."""
+
+    if route_scores.shape != routeable_mask.shape:
+        raise ValueError("route_scores and routeable_mask must have the same shape")
+    if not 0.0 <= min_normalized_entropy <= 1.0:
+        raise ValueError("min_normalized_entropy must be in [0, 1]")
+
+    route_scores = route_scores.float()
+    batch, seq_len = route_scores.shape[:2]
+    flat_scores = route_scores.reshape(batch, seq_len, -1)
+    flat_mask = routeable_mask.reshape(batch, seq_len, -1)
+    valid_count = flat_mask.sum(dim=-1)
+    valid = valid_count > 1
+    if not bool(valid.any()):
+        return route_scores.new_zeros(())
+
+    safe_scores = flat_scores.masked_fill(~flat_mask, torch.finfo(flat_scores.dtype).min)
+    probs = torch.softmax(safe_scores, dim=-1) * flat_mask.to(flat_scores.dtype)
+    probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(eps)
+    entropy = -(probs * torch.log(probs.clamp_min(eps))).sum(dim=-1)
+    max_entropy = torch.log(valid_count.to(entropy.dtype).clamp_min(2.0))
+    normalized_entropy = entropy / max_entropy.clamp_min(eps)
+    shortfall = (min_normalized_entropy - normalized_entropy[valid]).clamp_min(0.0)
+    return shortfall.square().mean()
+
+
 def routing_diagnostics(
     candidates: CandidateSelection,
     route_scores: torch.Tensor,

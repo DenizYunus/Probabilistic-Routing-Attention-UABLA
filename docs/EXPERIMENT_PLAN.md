@@ -357,3 +357,43 @@ PYTHONPATH=src python scripts/run_byte_lm.py \
 
 Shifted routing blocks are enabled by default. Use
 `--no-shifted-routing-blocks` for ablations against the single-grid router.
+
+Stage shifted routing without a manual checkpoint:
+
+```bash
+PYTHONPATH=src python scripts/run_byte_lm.py \
+  --task needle \
+  --attention uabla \
+  --text-file data/tinystories_combo.txt \
+  --seq-len 1024 \
+  --needle-min-gap 768 \
+  --needle-code-length 12 \
+  --local-window 128 \
+  --steps 10000 \
+  --stage-shifted-when-answer-accuracy 0.5 \
+  --route-budget-curriculum explore \
+  --route-budget-curriculum-boundaries 2500,6500 \
+  --route-entropy-weight 0.02 \
+  --route-entropy-min 0.35 \
+  --route-entropy-decay-steps 6500 \
+  --batch-size 4 \
+  --hidden-size 128 \
+  --layers 4 \
+  --byte-mixer-kernel 5 \
+  --byte-route-patch-size 16 \
+  --routed-span-left 2 \
+  --routed-span-right 8 \
+  --lm-loss-weight 0.2 \
+  --answer-loss-weight 5.0 \
+  --diagnostics-every 500 \
+  --amp \
+  --log-every 100 \
+  --save-checkpoint runs/byte_needle_uabla_staged_shifted.pt \
+  2>&1 | tee runs/byte_needle_uabla_staged_shifted.log
+```
+
+This starts with a wide sparse routing budget, narrows it in two phases, and
+decays an entropy floor so the router explores before specializing. Shifted
+blocks are enabled after a logged training batch reaches 50% answer accuracy,
+then training continues with the same weights and optimizer. Use
+`--stage-shifted-after-steps N` instead when you want a fixed-step ablation.
