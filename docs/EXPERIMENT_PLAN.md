@@ -260,6 +260,8 @@ tokens_per_second
 cache_dim_per_token_per_layer
 route_entropy
 avg_open_blocks
+avg_open_shifted_blocks
+avg_open_total_blocks
 avg_token_budget
 ```
 
@@ -352,3 +354,6 @@ PYTHONPATH=src python scripts/run_byte_lm.py \
   --log-every 100 \
   2>&1 | tee runs/byte_needle_uabla.log
 ```
+
+Shifted routing blocks are enabled by default. Use
+`--no-shifted-routing-blocks` for ablations against the single-grid router.

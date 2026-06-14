@@ -29,6 +29,10 @@ class CandidateSelection:
     opened_superblock_mask: torch.Tensor | None
     selected_centroid_mask: torch.Tensor
     opened_block_mask: torch.Tensor
+    selected_shifted_superblock_mask: torch.Tensor | None = None
+    opened_shifted_superblock_mask: torch.Tensor | None = None
+    selected_shifted_centroid_mask: torch.Tensor | None = None
+    opened_shifted_block_mask: torch.Tensor | None = None
 
 
 def uncertainty_to_bucket_values(
@@ -104,6 +108,43 @@ def summarize_block_centroids(
     log_sigma = 0.5 * torch.log(var.clamp_min(eps))
 
     return BlockCentroids(mu=mu, log_sigma=log_sigma, weight_sum=denom.squeeze(-1))
+
+
+def summarize_shifted_block_centroids(
+    mu_store: torch.Tensor,
+    log_sigma_store: torch.Tensor,
+    assignment_logits: torch.Tensor,
+    *,
+    block_size: int,
+    block_start_offset: int,
+    token_importance: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> BlockCentroids:
+    """Build block centroids for a second grid starting at ``block_start_offset``."""
+
+    if block_start_offset <= 0:
+        raise ValueError("block_start_offset must be positive")
+
+    batch, seq_len, routing_dim = mu_store.shape
+    centroids_per_block = assignment_logits.shape[-1]
+    if block_start_offset >= seq_len:
+        return BlockCentroids(
+            mu=mu_store.new_zeros(batch, 0, centroids_per_block, routing_dim),
+            log_sigma=log_sigma_store.new_zeros(batch, 0, centroids_per_block, routing_dim),
+            weight_sum=mu_store.new_zeros(batch, 0, centroids_per_block),
+        )
+
+    shifted_importance = (
+        token_importance[:, block_start_offset:] if token_importance is not None else None
+    )
+    return summarize_block_centroids(
+        mu_store[:, block_start_offset:],
+        log_sigma_store[:, block_start_offset:],
+        assignment_logits[:, block_start_offset:],
+        block_size=block_size,
+        token_importance=shifted_importance,
+        eps=eps,
+    )
 
 
 def summarize_superblock_centroids(
@@ -195,6 +236,8 @@ def compute_centroid_route_scores(
     log_sigma_seek: torch.Tensor,
     centroids: BlockCentroids,
     config: UABLAConfig,
+    *,
+    block_start_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score each token against routeable block centroids."""
 
@@ -210,14 +253,14 @@ def compute_centroid_route_scores(
     )
     route_scores = -distances / config.tau
 
-    token_positions = torch.arange(seq_len, device=mu_seek.device)
-    complete_blocks = (token_positions + 1) // config.block_size
-    block_positions = torch.arange(num_blocks, device=mu_seek.device)
-    routeable_mask = block_positions.view(1, 1, num_blocks, 1) < complete_blocks.view(
-        1,
-        seq_len,
-        1,
-        1,
+    routeable_mask = _routeable_block_mask(
+        batch=batch,
+        seq_len=seq_len,
+        num_blocks=num_blocks,
+        centroids_per_block=config.centroids_per_block,
+        block_size=config.block_size,
+        block_start_offset=block_start_offset,
+        device=mu_seek.device,
     )
     routeable_mask = routeable_mask.expand(batch, seq_len, num_blocks, config.centroids_per_block)
     route_scores = route_scores.masked_fill(
@@ -232,6 +275,8 @@ def compute_superblock_route_scores(
     log_sigma_seek: torch.Tensor,
     superblock_centroids: BlockCentroids,
     config: UABLAConfig,
+    *,
+    block_start_offset: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score each token against routeable superblock centroids."""
 
@@ -248,15 +293,20 @@ def compute_superblock_route_scores(
     route_scores = -distances / config.tau
 
     token_positions = torch.arange(seq_len, device=mu_seek.device)
-    complete_blocks = (token_positions + 1) // config.block_size
-    complete_superblocks = complete_blocks // config.superblock_size_blocks
     superblock_positions = torch.arange(num_superblocks, device=mu_seek.device)
+    superblock_end_positions = block_start_offset + (
+        (superblock_positions + 1) * config.superblock_size_blocks * config.block_size
+    )
     routeable_mask = superblock_positions.view(
         1,
         1,
         num_superblocks,
         1,
-    ) < complete_superblocks.view(1, seq_len, 1, 1)
+    ) >= 0
+    routeable_mask = routeable_mask & (
+        superblock_end_positions.view(1, 1, num_superblocks, 1)
+        <= (token_positions + 1).view(1, seq_len, 1, 1)
+    )
     routeable_mask = routeable_mask.expand(
         batch,
         seq_len,
@@ -280,6 +330,10 @@ def build_candidate_indices(
     routeable_mask: torch.Tensor | None = None,
     superblock_route_scores: torch.Tensor | None = None,
     superblock_routeable_mask: torch.Tensor | None = None,
+    shifted_route_scores: torch.Tensor | None = None,
+    shifted_routeable_mask: torch.Tensor | None = None,
+    shifted_superblock_route_scores: torch.Tensor | None = None,
+    shifted_superblock_routeable_mask: torch.Tensor | None = None,
 ) -> CandidateSelection:
     """Build padded causal candidate indices without constructing a T x T matrix."""
 
@@ -342,6 +396,38 @@ def build_candidate_indices(
             dtype=torch.bool,
         )
 
+    use_shifted = (
+        config.use_shifted_blocks
+        and shifted_route_scores is not None
+        and shifted_routeable_mask is not None
+        and shifted_route_scores.shape[2] > 0
+    )
+    shifted_offset = config.shifted_block_offset_value
+    shifted_num_blocks = shifted_route_scores.shape[2] if use_shifted else 0
+    selected_shifted_centroid_mask = None
+    opened_shifted_block_mask = None
+    selected_shifted_superblock_mask = None
+    opened_shifted_superblock_mask = None
+    if use_shifted:
+        selected_shifted_centroid_mask = torch.zeros_like(shifted_routeable_mask)
+        opened_shifted_block_mask = torch.zeros(
+            (batch, seq_len, shifted_num_blocks),
+            device=device,
+            dtype=torch.bool,
+        )
+        if (
+            config.use_multiscale_routing
+            and shifted_superblock_route_scores is not None
+            and shifted_superblock_routeable_mask is not None
+            and superblock_budgets is not None
+        ):
+            selected_shifted_superblock_mask = torch.zeros_like(shifted_superblock_routeable_mask)
+            opened_shifted_superblock_mask = torch.zeros(
+                shifted_superblock_route_scores.shape[:3],
+                device=device,
+                dtype=torch.bool,
+            )
+
     if route_scores is None or routeable_mask is None:
         route_scores, routeable_mask = compute_centroid_route_scores(
             mu_seek,
@@ -377,16 +463,80 @@ def build_candidate_indices(
                     selected_superblock_mask=selected_superblock_mask,
                     opened_superblock_mask=opened_superblock_mask,
                 )
+                shifted_block_pool: list[int] = []
+                if use_shifted:
+                    shifted_complete_blocks = min(
+                        shifted_num_blocks,
+                        _complete_blocks_at_token(
+                            token_idx,
+                            block_size=config.block_size,
+                            block_start_offset=shifted_offset,
+                        ),
+                    )
+                    shifted_block_pool = _select_block_pool(
+                        batch_idx=batch_idx,
+                        token_idx=token_idx,
+                        complete_blocks=shifted_complete_blocks,
+                        config=config,
+                        superblock_budgets=superblock_budgets,
+                        superblock_scores_for_topk=(
+                            shifted_superblock_route_scores.detach()
+                            if shifted_superblock_route_scores is not None
+                            else None
+                        ),
+                        superblock_routeable_mask=shifted_superblock_routeable_mask,
+                        selected_superblock_mask=selected_shifted_superblock_mask,
+                        opened_superblock_mask=opened_shifted_superblock_mask,
+                    )
 
                 centroid_budget = int(centroid_budgets[batch_idx, token_idx].item())
-                if complete_blocks > 0 and centroid_budget > 0 and block_pool:
-                    block_tensor = torch.tensor(block_pool, device=device, dtype=torch.long)
-                    block_scores = route_scores_for_topk[batch_idx, token_idx, block_tensor]
-                    block_routeable = routeable_mask[batch_idx, token_idx, block_tensor]
-                    flat_scores = block_scores.reshape(block_tensor.numel() * config.centroids_per_block)
-                    flat_routeable = block_routeable.reshape(
-                        block_tensor.numel() * config.centroids_per_block,
-                    )
+                if centroid_budget > 0 and (block_pool or shifted_block_pool):
+                    score_parts: list[torch.Tensor] = []
+                    routeable_parts: list[torch.Tensor] = []
+                    block_tensors: list[torch.Tensor | None] = [None, None]
+                    if complete_blocks > 0 and block_pool:
+                        block_tensor = torch.tensor(block_pool, device=device, dtype=torch.long)
+                        block_tensors[0] = block_tensor
+                        block_scores = route_scores_for_topk[batch_idx, token_idx, block_tensor]
+                        block_routeable = routeable_mask[batch_idx, token_idx, block_tensor]
+                        score_parts.append(
+                            block_scores.reshape(block_tensor.numel() * config.centroids_per_block),
+                        )
+                        routeable_parts.append(
+                            block_routeable.reshape(
+                                block_tensor.numel() * config.centroids_per_block,
+                            ),
+                        )
+                    if use_shifted and shifted_block_pool:
+                        shifted_block_tensor = torch.tensor(
+                            shifted_block_pool,
+                            device=device,
+                            dtype=torch.long,
+                        )
+                        block_tensors[1] = shifted_block_tensor
+                        shifted_block_scores = shifted_route_scores.detach()[
+                            batch_idx,
+                            token_idx,
+                            shifted_block_tensor,
+                        ]
+                        shifted_block_routeable = shifted_routeable_mask[
+                            batch_idx,
+                            token_idx,
+                            shifted_block_tensor,
+                        ]
+                        score_parts.append(
+                            shifted_block_scores.reshape(
+                                shifted_block_tensor.numel() * config.centroids_per_block,
+                            ),
+                        )
+                        routeable_parts.append(
+                            shifted_block_routeable.reshape(
+                                shifted_block_tensor.numel() * config.centroids_per_block,
+                            ),
+                        )
+
+                    flat_scores = torch.cat(score_parts, dim=0)
+                    flat_routeable = torch.cat(routeable_parts, dim=0)
                     valid_count = int(flat_routeable.sum().item())
                     if valid_count > 0:
                         top_k = min(centroid_budget, valid_count)
@@ -398,23 +548,66 @@ def build_candidate_indices(
 
                         opened_blocks: list[int] = []
                         opened_seen: set[int] = set()
+                        opened_shifted_blocks: list[int] = []
+                        opened_shifted_seen: set[int] = set()
+                        base_centroid_count = (
+                            0
+                            if block_tensors[0] is None
+                            else block_tensors[0].numel() * config.centroids_per_block
+                        )
                         for centroid_idx in top_centroids.tolist():
-                            pool_idx = centroid_idx // config.centroids_per_block
-                            block_idx = int(block_tensor[pool_idx].item())
-                            local_centroid_idx = centroid_idx % config.centroids_per_block
-                            selected_centroid_mask[
-                                batch_idx,
-                                token_idx,
-                                block_idx,
-                                local_centroid_idx,
-                            ] = True
-                            if block_idx not in opened_seen:
-                                opened_seen.add(block_idx)
-                                opened_blocks.append(block_idx)
-                                opened_block_mask[batch_idx, token_idx, block_idx] = True
+                            if centroid_idx < base_centroid_count:
+                                block_tensor = block_tensors[0]
+                                if block_tensor is None:
+                                    continue
+                                pool_idx = centroid_idx // config.centroids_per_block
+                                block_idx = int(block_tensor[pool_idx].item())
+                                local_centroid_idx = centroid_idx % config.centroids_per_block
+                                selected_centroid_mask[
+                                    batch_idx,
+                                    token_idx,
+                                    block_idx,
+                                    local_centroid_idx,
+                                ] = True
+                                if block_idx not in opened_seen:
+                                    opened_seen.add(block_idx)
+                                    opened_blocks.append(block_idx)
+                                    opened_block_mask[batch_idx, token_idx, block_idx] = True
+                            elif use_shifted and selected_shifted_centroid_mask is not None:
+                                shifted_block_tensor = block_tensors[1]
+                                if shifted_block_tensor is None:
+                                    continue
+                                shifted_centroid_idx = centroid_idx - base_centroid_count
+                                pool_idx = shifted_centroid_idx // config.centroids_per_block
+                                block_idx = int(shifted_block_tensor[pool_idx].item())
+                                local_centroid_idx = (
+                                    shifted_centroid_idx % config.centroids_per_block
+                                )
+                                selected_shifted_centroid_mask[
+                                    batch_idx,
+                                    token_idx,
+                                    block_idx,
+                                    local_centroid_idx,
+                                ] = True
+                                if block_idx not in opened_shifted_seen:
+                                    opened_shifted_seen.add(block_idx)
+                                    opened_shifted_blocks.append(block_idx)
+                                    if opened_shifted_block_mask is not None:
+                                        opened_shifted_block_mask[
+                                            batch_idx,
+                                            token_idx,
+                                            block_idx,
+                                        ] = True
 
                         for block_idx in opened_blocks:
                             block_start = block_idx * config.block_size
+                            block_end = min(block_start + config.block_size, token_idx + 1, seq_len)
+                            for candidate_idx in range(block_start, block_end):
+                                if candidate_idx not in seen:
+                                    seen.add(candidate_idx)
+                                    out.append(candidate_idx)
+                        for block_idx in opened_shifted_blocks:
+                            block_start = shifted_offset + block_idx * config.block_size
                             block_end = min(block_start + config.block_size, token_idx + 1, seq_len)
                             for candidate_idx in range(block_start, block_end):
                                 if candidate_idx not in seen:
@@ -438,6 +631,10 @@ def build_candidate_indices(
         opened_superblock_mask=opened_superblock_mask,
         selected_centroid_mask=selected_centroid_mask,
         opened_block_mask=opened_block_mask,
+        selected_shifted_superblock_mask=selected_shifted_superblock_mask,
+        opened_shifted_superblock_mask=opened_shifted_superblock_mask,
+        selected_shifted_centroid_mask=selected_shifted_centroid_mask,
+        opened_shifted_block_mask=opened_shifted_block_mask,
     )
 
 
@@ -451,6 +648,10 @@ def build_candidate_indices_vectorized(
     routeable_mask: torch.Tensor,
     superblock_route_scores: torch.Tensor | None = None,
     superblock_routeable_mask: torch.Tensor | None = None,
+    shifted_route_scores: torch.Tensor | None = None,
+    shifted_routeable_mask: torch.Tensor | None = None,
+    shifted_superblock_route_scores: torch.Tensor | None = None,
+    shifted_superblock_routeable_mask: torch.Tensor | None = None,
 ) -> CandidateSelection:
     """Vectorized fixed-shape candidate builder for GPU/MPS-friendly training."""
 
@@ -490,45 +691,99 @@ def build_candidate_indices_vectorized(
         and superblock_route_scores is not None
         and superblock_routeable_mask is not None
     ):
-        selected_superblock_mask, _, _ = _topk_per_token(
-            superblock_route_scores.detach(),
-            superblock_routeable_mask,
-            superblock_budgets,
-            max(config.superblock_hit_buckets),
+        selected_superblock_mask, opened_superblock_mask, superblock_block_mask = (
+            _superblock_to_block_mask(
+                superblock_route_scores.detach(),
+                superblock_routeable_mask,
+                superblock_budgets,
+                config,
+                num_blocks=num_blocks,
+                seq_len=seq_len,
+                block_start_offset=0,
+            )
         )
-        opened_superblock_mask = selected_superblock_mask.any(dim=-1)
-        num_superblocks = opened_superblock_mask.shape[-1]
-        block_ids = torch.arange(num_blocks, device=device)
-        superblock_ids = block_ids // config.superblock_size_blocks
-        superblock_ids = superblock_ids.clamp(max=num_superblocks - 1)
-        superblock_block_mask = torch.gather(
-            opened_superblock_mask,
-            dim=2,
-            index=superblock_ids.view(1, 1, num_blocks).expand(batch, seq_len, num_blocks),
-        )
-
-        token_positions = torch.arange(seq_len, device=device)
-        complete_blocks = (token_positions + 1) // config.block_size
-        block_positions = torch.arange(num_blocks, device=device)
-        tail_start = (complete_blocks // config.superblock_size_blocks) * config.superblock_size_blocks
-        tail_mask = (
-            (block_positions.view(1, num_blocks) >= tail_start.view(seq_len, 1))
-            & (block_positions.view(1, num_blocks) < complete_blocks.view(seq_len, 1))
-        )
-        superblock_block_mask = superblock_block_mask | tail_mask.view(1, seq_len, num_blocks)
 
     constrained_routeable = routeable_mask
     if superblock_block_mask is not None:
         constrained_routeable = routeable_mask & superblock_block_mask.unsqueeze(-1)
 
-    selected_centroid_mask, top_centroid_indices, top_centroid_valid = _topk_per_token(
-        route_scores.detach(),
-        constrained_routeable,
+    use_shifted = (
+        config.use_shifted_blocks
+        and shifted_route_scores is not None
+        and shifted_routeable_mask is not None
+        and shifted_route_scores.shape[2] > 0
+    )
+    shifted_offset = config.shifted_block_offset_value
+    shifted_num_blocks = shifted_route_scores.shape[2] if use_shifted else 0
+    selected_shifted_superblock_mask = None
+    opened_shifted_superblock_mask = None
+    shifted_superblock_block_mask = None
+    if (
+        use_shifted
+        and config.use_multiscale_routing
+        and shifted_superblock_route_scores is not None
+        and shifted_superblock_routeable_mask is not None
+    ):
+        (
+            selected_shifted_superblock_mask,
+            opened_shifted_superblock_mask,
+            shifted_superblock_block_mask,
+        ) = _superblock_to_block_mask(
+            shifted_superblock_route_scores.detach(),
+            shifted_superblock_routeable_mask,
+            superblock_budgets,
+            config,
+            num_blocks=shifted_num_blocks,
+            seq_len=seq_len,
+            block_start_offset=shifted_offset,
+        )
+
+    shifted_constrained_routeable = None
+    if use_shifted:
+        shifted_constrained_routeable = shifted_routeable_mask
+        if shifted_superblock_block_mask is not None:
+            shifted_constrained_routeable = (
+                shifted_routeable_mask & shifted_superblock_block_mask.unsqueeze(-1)
+            )
+
+    flat_scores = route_scores.detach().reshape(batch, seq_len, -1)
+    flat_valid = constrained_routeable.reshape(batch, seq_len, -1)
+    base_flat_count = flat_scores.shape[-1]
+    if use_shifted and shifted_constrained_routeable is not None:
+        flat_scores = torch.cat(
+            [flat_scores, shifted_route_scores.detach().reshape(batch, seq_len, -1)],
+            dim=-1,
+        )
+        flat_valid = torch.cat(
+            [flat_valid, shifted_constrained_routeable.reshape(batch, seq_len, -1)],
+            dim=-1,
+        )
+
+    selected_flat, top_centroid_indices, top_centroid_valid = _topk_flat_per_token(
+        flat_scores,
+        flat_valid,
         centroid_budgets,
         max(config.centroid_hit_buckets),
     )
+    selected_centroid_mask = selected_flat[..., :base_flat_count].reshape_as(routeable_mask)
     opened_block_mask = selected_centroid_mask.any(dim=-1)
-    top_block_indices = top_centroid_indices // config.centroids_per_block
+    selected_shifted_centroid_mask = None
+    opened_shifted_block_mask = None
+    if use_shifted and shifted_routeable_mask is not None:
+        selected_shifted_centroid_mask = selected_flat[..., base_flat_count:].reshape_as(
+            shifted_routeable_mask,
+        )
+        opened_shifted_block_mask = selected_shifted_centroid_mask.any(dim=-1)
+
+    top_is_shifted = top_centroid_indices >= base_flat_count
+    base_top_block_indices = top_centroid_indices // config.centroids_per_block
+    shifted_top_block_indices = (
+        (top_centroid_indices - base_flat_count).clamp_min(0) // config.centroids_per_block
+    )
+    top_block_starts = base_top_block_indices * config.block_size
+    if use_shifted:
+        shifted_block_starts = shifted_offset + shifted_top_block_indices * config.block_size
+        top_block_starts = torch.where(top_is_shifted, shifted_block_starts, top_block_starts)
     top_block_valid = top_centroid_valid
 
     local_indices, local_mask = _local_candidate_indices(
@@ -537,8 +792,8 @@ def build_candidate_indices_vectorized(
         local_window=config.local_window,
         device=device,
     )
-    routed_indices, routed_mask = _routed_block_candidate_indices(
-        top_block_indices,
+    routed_indices, routed_mask = _routed_block_candidate_indices_from_starts(
+        top_block_starts,
         top_block_valid,
         seq_len=seq_len,
         block_size=config.block_size,
@@ -558,7 +813,32 @@ def build_candidate_indices_vectorized(
         opened_superblock_mask=opened_superblock_mask,
         selected_centroid_mask=selected_centroid_mask,
         opened_block_mask=opened_block_mask,
+        selected_shifted_superblock_mask=selected_shifted_superblock_mask,
+        opened_shifted_superblock_mask=opened_shifted_superblock_mask,
+        selected_shifted_centroid_mask=selected_shifted_centroid_mask,
+        opened_shifted_block_mask=opened_shifted_block_mask,
     )
+
+
+def _topk_flat_per_token(
+    flat_scores: torch.Tensor,
+    flat_valid: torch.Tensor,
+    budgets: torch.Tensor,
+    max_k: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    safe_scores = flat_scores.masked_fill(~flat_valid, torch.finfo(flat_scores.dtype).min)
+    max_k = min(max_k, flat_scores.shape[-1])
+    top_idx = torch.topk(safe_scores, k=max_k, dim=-1).indices
+    top_valid = torch.gather(flat_valid, dim=-1, index=top_idx)
+    budget_mask = (
+        torch.arange(max_k, device=flat_scores.device).view(1, 1, max_k)
+        < budgets.clamp(max=max_k).unsqueeze(-1)
+    )
+    top_valid = top_valid & budget_mask
+    selected = torch.zeros_like(flat_valid)
+    selected.scatter_(dim=-1, index=top_idx, src=top_valid)
+    selected = selected & flat_valid
+    return selected, top_idx, top_valid
 
 
 def _topk_per_token(
@@ -569,18 +849,12 @@ def _topk_per_token(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     flat_scores = scores.reshape(*scores.shape[:2], -1)
     flat_valid = valid_mask.reshape(*valid_mask.shape[:2], -1)
-    safe_scores = flat_scores.masked_fill(~flat_valid, torch.finfo(flat_scores.dtype).min)
-    max_k = min(max_k, flat_scores.shape[-1])
-    top_idx = torch.topk(safe_scores, k=max_k, dim=-1).indices
-    top_valid = torch.gather(flat_valid, dim=-1, index=top_idx)
-    budget_mask = (
-        torch.arange(max_k, device=scores.device).view(1, 1, max_k)
-        < budgets.clamp(max=max_k).unsqueeze(-1)
+    selected, top_idx, top_valid = _topk_flat_per_token(
+        flat_scores,
+        flat_valid,
+        budgets,
+        max_k,
     )
-    top_valid = top_valid & budget_mask
-    selected = torch.zeros_like(flat_valid)
-    selected.scatter_(dim=-1, index=top_idx, src=top_valid)
-    selected = selected & flat_valid
     return selected.reshape_as(valid_mask), top_idx, top_valid
 
 
@@ -609,9 +883,23 @@ def _routed_block_candidate_indices(
     seq_len: int,
     block_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    batch, seq_len_from_blocks, block_count = block_indices.shape
-    device = block_indices.device
-    block_starts = block_indices * block_size
+    return _routed_block_candidate_indices_from_starts(
+        block_indices * block_size,
+        block_valid,
+        seq_len=seq_len,
+        block_size=block_size,
+    )
+
+
+def _routed_block_candidate_indices_from_starts(
+    block_starts: torch.Tensor,
+    block_valid: torch.Tensor,
+    *,
+    seq_len: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch, seq_len_from_blocks, block_count = block_starts.shape
+    device = block_starts.device
     offsets = torch.arange(block_size, device=device)
     block_token_indices = block_starts.unsqueeze(-1) + offsets.view(1, 1, 1, block_size)
     indices = block_token_indices.reshape(batch, seq_len_from_blocks, block_count * block_size)
@@ -679,6 +967,98 @@ def _mask_duplicate_candidates(
     duplicate = torch.zeros_like(mask)
     duplicate.scatter_(dim=-1, index=sorted_positions, src=duplicate_sorted)
     return indices, mask & ~duplicate
+
+
+def _routeable_block_mask(
+    *,
+    batch: int,
+    seq_len: int,
+    num_blocks: int,
+    centroids_per_block: int,
+    block_size: int,
+    block_start_offset: int,
+    device: torch.device,
+) -> torch.Tensor:
+    token_positions = torch.arange(seq_len, device=device)
+    block_positions = torch.arange(num_blocks, device=device)
+    block_end_positions = block_start_offset + (block_positions + 1) * block_size
+    routeable_mask = block_end_positions.view(1, 1, num_blocks, 1) <= (
+        token_positions + 1
+    ).view(1, seq_len, 1, 1)
+    return routeable_mask.expand(batch, seq_len, num_blocks, centroids_per_block)
+
+
+def _complete_blocks_by_position(
+    *,
+    seq_len: int,
+    block_size: int,
+    block_start_offset: int,
+    device: torch.device,
+) -> torch.Tensor:
+    token_positions = torch.arange(seq_len, device=device)
+    complete = torch.div(
+        token_positions + 1 - block_start_offset,
+        block_size,
+        rounding_mode="floor",
+    )
+    return complete.clamp_min(0)
+
+
+def _complete_blocks_at_token(
+    token_idx: int,
+    *,
+    block_size: int,
+    block_start_offset: int,
+) -> int:
+    return max(0, (token_idx + 1 - block_start_offset) // block_size)
+
+
+def _superblock_to_block_mask(
+    superblock_route_scores: torch.Tensor,
+    superblock_routeable_mask: torch.Tensor,
+    superblock_budgets: torch.Tensor | None,
+    config: UABLAConfig,
+    *,
+    num_blocks: int,
+    seq_len: int,
+    block_start_offset: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if superblock_budgets is None:
+        raise ValueError("superblock_budgets are required for superblock routing")
+
+    selected_superblock_mask, _, _ = _topk_per_token(
+        superblock_route_scores,
+        superblock_routeable_mask,
+        superblock_budgets,
+        max(config.superblock_hit_buckets),
+    )
+    opened_superblock_mask = selected_superblock_mask.any(dim=-1)
+    batch = opened_superblock_mask.shape[0]
+    num_superblocks = opened_superblock_mask.shape[-1]
+    device = superblock_route_scores.device
+
+    block_ids = torch.arange(num_blocks, device=device)
+    superblock_ids = (block_ids // config.superblock_size_blocks).clamp(max=num_superblocks - 1)
+    superblock_block_mask = torch.gather(
+        opened_superblock_mask,
+        dim=2,
+        index=superblock_ids.view(1, 1, num_blocks).expand(batch, seq_len, num_blocks),
+    )
+
+    complete_blocks = _complete_blocks_by_position(
+        seq_len=seq_len,
+        block_size=config.block_size,
+        block_start_offset=block_start_offset,
+        device=device,
+    ).clamp(max=num_blocks)
+    block_positions = torch.arange(num_blocks, device=device)
+    tail_start = (complete_blocks // config.superblock_size_blocks) * config.superblock_size_blocks
+    tail_mask = (
+        (block_positions.view(1, num_blocks) >= tail_start.view(seq_len, 1))
+        & (block_positions.view(1, num_blocks) < complete_blocks.view(seq_len, 1))
+    )
+    superblock_block_mask = superblock_block_mask | tail_mask.view(1, seq_len, num_blocks)
+    return selected_superblock_mask, opened_superblock_mask, superblock_block_mask
 
 
 def _select_block_pool(

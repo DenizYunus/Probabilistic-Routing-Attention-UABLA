@@ -42,6 +42,8 @@ class UABLAConfig:
     hybrid_score_scale: float = 0.1
     routed_span_left: int = 2
     routed_span_right: int = 8
+    use_shifted_blocks: bool = True
+    shifted_block_offset: int | None = None
 
     def __post_init__(self) -> None:
         if self.hidden_size <= 0:
@@ -98,6 +100,19 @@ class UABLAConfig:
             raise ValueError("routed_span_left cannot be negative")
         if self.routed_span_right < 0:
             raise ValueError("routed_span_right cannot be negative")
+        if self.shifted_block_offset is not None and self.shifted_block_offset <= 0:
+            raise ValueError("shifted_block_offset must be positive when provided")
+        if self.use_shifted_blocks:
+            if self.shifted_block_offset_value <= 0:
+                raise ValueError("shifted_block_offset must be positive")
+            if self.shifted_block_offset_value >= self.block_size:
+                raise ValueError("shifted_block_offset must be smaller than block_size")
+
+    @property
+    def shifted_block_offset_value(self) -> int:
+        if self.shifted_block_offset is not None:
+            return self.shifted_block_offset
+        return self.block_size // 2
 
     @property
     def cache_dim(self) -> int:

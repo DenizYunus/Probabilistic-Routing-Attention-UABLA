@@ -20,6 +20,7 @@ Then use:
 local window
 + four-centroid superblock routing
 + four-centroid block routing
++ half-stride shifted block routing summaries
 + adaptive bucketed token selection
 ```
 
@@ -31,17 +32,18 @@ to reduce cache memory and long-context attention compute.
 2. Use four centroids per block.
 3. Use multiscale four-centroid superblock routing before block routing.
 4. Route against block centroids after superblock narrowing.
-5. Open deduplicated dense parent blocks after centroid routing.
-6. Expand selected routed tokens with a causal successor-biased byte span.
-7. Always include a local causal window.
-8. Use bucketed top-k, not true top-p, in V1.
-9. Use a cheap diagonal Gaussian distance plus optional low-rank hybrid scoring.
-10. Use straight-through differentiable sparse routing.
-11. Support training-only dense-attention teacher distillation.
-12. Keep memory importance within the existing 448-dim cache budget.
-13. Keep the implementation causal.
-14. Never materialize a full `T x T` distance matrix in serious paths.
-15. Treat this as an attention/cache research prototype, not a DeepSeek-scale training recipe.
+5. Route over both regular and half-stride shifted block summaries.
+6. Open deduplicated dense parent blocks after centroid routing.
+7. Expand selected routed tokens with a causal successor-biased byte span.
+8. Always include a local causal window.
+9. Use bucketed top-k, not true top-p, in V1.
+10. Use a cheap diagonal Gaussian distance plus optional low-rank hybrid scoring.
+11. Use straight-through differentiable sparse routing.
+12. Support training-only dense-attention teacher distillation.
+13. Keep memory importance within the existing 448-dim cache budget.
+14. Keep the implementation causal.
+15. Never materialize a full `T x T` distance matrix in serious paths.
+16. Treat this as an attention/cache research prototype, not a DeepSeek-scale training recipe.
 
 ## Locked Dimensions
 
@@ -71,6 +73,8 @@ block_size = 128
 centroids_per_block = 4
 tokens_per_centroid_average = 32
 superblock_size_blocks = 8
+use_shifted_blocks = true
+shifted_block_offset = block_size / 2
 ```
 
 Each block owns four centroid distributions:
@@ -85,6 +89,21 @@ where:
 b = block index
 c = centroid index in {0, 1, 2, 3}
 ```
+
+V1 also builds a second shifted routing grid:
+
+```text
+regular blocks:
+[0..127]     [128..255]     [256..383] ...
+
+shifted blocks:
+      [64..191]      [192..319]      [320..447] ...
+```
+
+The shifted grid exists only as routing summaries. Token cache entries are not
+duplicated, so shifted routing does not change the per-token cache dimension.
+Regular and shifted block centroids compete in one global centroid top-k, so
+the final routed candidate width stays fixed instead of doubling.
 
 ## Centroid Construction
 
@@ -148,11 +167,12 @@ mean of child centroid memories
 Routing order:
 
 ```text
-1. score routeable superblock centroids
-2. select adaptive superblock hits
+1. score routeable regular and shifted superblock centroids
+2. select adaptive superblock hits per grid
 3. restrict block-centroid routing to opened superblocks plus recent tail blocks
-4. open deduplicated parent blocks
-5. select tokens inside gathered candidates
+4. select a global top-k across regular and shifted block centroids
+5. open deduplicated parent token ranges
+6. select tokens inside gathered candidates
 ```
 
 Default superblock-hit buckets:

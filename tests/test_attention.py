@@ -36,10 +36,14 @@ def test_attention_output_and_cache_shapes() -> None:
     assert result.centroids.mu.shape == (2, 3, 4, config.routing_dim)
     assert result.superblock_centroids is not None
     assert result.superblock_centroids.mu.shape == (2, 1, 4, config.routing_dim)
+    assert result.shifted_centroids is not None
+    assert result.shifted_centroids.mu.shape == (2, 2, 4, config.routing_dim)
     assert result.candidates is not None
     assert result.candidates.indices.shape[:2] == (2, 10)
     assert result.route_scores is not None
     assert result.route_scores.shape == (2, 10, 3, 4)
+    assert result.shifted_route_scores is not None
+    assert result.shifted_route_scores.shape == (2, 10, 2, 4)
     assert result.memory_importance is not None
     assert result.memory_importance.shape == (2, 10)
 

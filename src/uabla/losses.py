@@ -272,9 +272,17 @@ def routing_diagnostics(
         "avg_centroid_budget": candidates.centroid_budgets.float().mean(),
         "avg_token_budget": candidates.token_budgets.float().mean(),
     }
+    if candidates.opened_shifted_block_mask is not None:
+        avg_open_shifted = candidates.opened_shifted_block_mask.sum(dim=-1).float().mean()
+        diagnostics["avg_open_shifted_blocks"] = avg_open_shifted
+        diagnostics["avg_open_total_blocks"] = diagnostics["avg_open_blocks"] + avg_open_shifted
     if candidates.opened_superblock_mask is not None:
         diagnostics["avg_open_superblocks"] = (
             candidates.opened_superblock_mask.sum(dim=-1).float().mean()
+        )
+    if candidates.opened_shifted_superblock_mask is not None:
+        diagnostics["avg_open_shifted_superblocks"] = (
+            candidates.opened_shifted_superblock_mask.sum(dim=-1).float().mean()
         )
     if candidates.superblock_budgets is not None:
         diagnostics["avg_superblock_budget"] = candidates.superblock_budgets.float().mean()

@@ -11,9 +11,16 @@ def test_default_cache_dim_is_locked_to_448() -> None:
     assert config.centroids_per_block == 4
     assert config.routed_span_left == 2
     assert config.routed_span_right == 8
+    assert config.use_shifted_blocks
+    assert config.shifted_block_offset_value == 64
     assert config.cache_dim == 448
 
 
 def test_v1_rejects_non_four_centroids() -> None:
     with pytest.raises(ValueError, match="exactly 4 centroids"):
         UABLAConfig(hidden_size=128, centroids_per_block=3)
+
+
+def test_shifted_block_offset_must_stay_inside_block() -> None:
+    with pytest.raises(ValueError, match="smaller than block_size"):
+        UABLAConfig(hidden_size=128, block_size=16, shifted_block_offset=16)

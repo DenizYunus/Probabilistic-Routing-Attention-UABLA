@@ -18,6 +18,7 @@ from .routing import (
     compute_centroid_route_scores,
     compute_superblock_route_scores,
     summarize_block_centroids,
+    summarize_shifted_block_centroids,
     summarize_superblock_centroids,
 )
 
@@ -28,11 +29,17 @@ class UABLAOutput:
     cache: torch.Tensor | None = None
     centroids: BlockCentroids | None = None
     superblock_centroids: BlockCentroids | None = None
+    shifted_centroids: BlockCentroids | None = None
+    shifted_superblock_centroids: BlockCentroids | None = None
     candidates: CandidateSelection | None = None
     route_scores: torch.Tensor | None = None
     routeable_mask: torch.Tensor | None = None
     superblock_route_scores: torch.Tensor | None = None
     superblock_routeable_mask: torch.Tensor | None = None
+    shifted_route_scores: torch.Tensor | None = None
+    shifted_routeable_mask: torch.Tensor | None = None
+    shifted_superblock_route_scores: torch.Tensor | None = None
+    shifted_superblock_routeable_mask: torch.Tensor | None = None
     attention: torch.Tensor | None = None
     token_scores: torch.Tensor | None = None
     memory_importance: torch.Tensor | None = None
@@ -136,6 +143,49 @@ class UABLAAttention(nn.Module):
             centroids,
             config,
         )
+
+        shifted_centroids = None
+        shifted_superblock_centroids = None
+        shifted_route_scores = None
+        shifted_routeable_mask = None
+        shifted_superblock_route_scores = None
+        shifted_superblock_routeable_mask = None
+        shifted_offset = config.shifted_block_offset_value
+        if config.use_shifted_blocks and shifted_offset < seq_len:
+            shifted_centroids = summarize_shifted_block_centroids(
+                mu_store,
+                log_sigma_store,
+                assignment_logits,
+                block_size=config.block_size,
+                block_start_offset=shifted_offset,
+                token_importance=memory_importance,
+                eps=config.eps,
+            )
+            if shifted_centroids.mu.shape[1] > 0:
+                shifted_route_scores, shifted_routeable_mask = compute_centroid_route_scores(
+                    mu_seek,
+                    log_sigma_seek,
+                    shifted_centroids,
+                    config,
+                    block_start_offset=shifted_offset,
+                )
+                if config.use_multiscale_routing:
+                    shifted_superblock_centroids = summarize_superblock_centroids(
+                        shifted_centroids,
+                        superblock_size_blocks=config.superblock_size_blocks,
+                        eps=config.eps,
+                    )
+                    (
+                        shifted_superblock_route_scores,
+                        shifted_superblock_routeable_mask,
+                    ) = compute_superblock_route_scores(
+                        mu_seek,
+                        log_sigma_seek,
+                        shifted_superblock_centroids,
+                        config,
+                        block_start_offset=shifted_offset,
+                    )
+
         if config.vectorized_routing:
             candidates = build_candidate_indices_vectorized(
                 mu_seek,
@@ -146,6 +196,10 @@ class UABLAAttention(nn.Module):
                 routeable_mask=routeable_mask,
                 superblock_route_scores=superblock_route_scores,
                 superblock_routeable_mask=superblock_routeable_mask,
+                shifted_route_scores=shifted_route_scores,
+                shifted_routeable_mask=shifted_routeable_mask,
+                shifted_superblock_route_scores=shifted_superblock_route_scores,
+                shifted_superblock_routeable_mask=shifted_superblock_routeable_mask,
             )
         else:
             candidates = build_candidate_indices(
@@ -157,6 +211,10 @@ class UABLAAttention(nn.Module):
                 routeable_mask=routeable_mask,
                 superblock_route_scores=superblock_route_scores,
                 superblock_routeable_mask=superblock_routeable_mask,
+                shifted_route_scores=shifted_route_scores,
+                shifted_routeable_mask=shifted_routeable_mask,
+                shifted_superblock_route_scores=shifted_superblock_route_scores,
+                shifted_superblock_routeable_mask=shifted_superblock_routeable_mask,
             )
 
         safe_indices = candidates.indices.clamp_min(0)
@@ -188,6 +246,9 @@ class UABLAAttention(nn.Module):
             route_scores,
             routeable_mask,
             candidates.opened_block_mask,
+            shifted_route_scores=shifted_route_scores,
+            shifted_routeable_mask=shifted_routeable_mask,
+            opened_shifted_block_mask=candidates.opened_shifted_block_mask,
         )
         scores = scores + self._relative_position_bias(candidates.indices, seq_len)
         scores = scores.masked_fill(~candidates.mask, torch.finfo(scores.dtype).min)
@@ -227,11 +288,23 @@ class UABLAAttention(nn.Module):
                 cache=cache,
                 centroids=centroids if return_routing else None,
                 superblock_centroids=superblock_centroids if return_routing else None,
+                shifted_centroids=shifted_centroids if return_routing else None,
+                shifted_superblock_centroids=(
+                    shifted_superblock_centroids if return_routing else None
+                ),
                 candidates=candidates if return_routing else None,
                 route_scores=route_scores if return_routing else None,
                 routeable_mask=routeable_mask if return_routing else None,
                 superblock_route_scores=superblock_route_scores if return_routing else None,
                 superblock_routeable_mask=superblock_routeable_mask if return_routing else None,
+                shifted_route_scores=shifted_route_scores if return_routing else None,
+                shifted_routeable_mask=shifted_routeable_mask if return_routing else None,
+                shifted_superblock_route_scores=(
+                    shifted_superblock_route_scores if return_routing else None
+                ),
+                shifted_superblock_routeable_mask=(
+                    shifted_superblock_routeable_mask if return_routing else None
+                ),
                 attention=attn if return_attention else None,
                 token_scores=scores if return_attention or return_token_scores else None,
                 memory_importance=memory_importance if return_routing else None,
@@ -253,6 +326,67 @@ class UABLAAttention(nn.Module):
         route_scores: torch.Tensor,
         routeable_mask: torch.Tensor,
         opened_block_mask: torch.Tensor,
+        *,
+        shifted_route_scores: torch.Tensor | None = None,
+        shifted_routeable_mask: torch.Tensor | None = None,
+        opened_shifted_block_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        straight_through_block = self._straight_through_block_prior(
+            route_scores,
+            routeable_mask,
+            opened_block_mask,
+        )
+        num_blocks = route_scores.shape[2]
+
+        candidate_blocks = (candidate_indices.clamp_min(0) // self.config.block_size).clamp(
+            max=num_blocks - 1,
+        )
+        gathered_prior = torch.gather(straight_through_block, dim=2, index=candidate_blocks)
+        gathered_opened = torch.gather(opened_block_mask, dim=2, index=candidate_blocks)
+        prior = torch.where(gathered_opened & candidate_mask, gathered_prior, torch.zeros_like(gathered_prior))
+
+        if (
+            shifted_route_scores is not None
+            and shifted_routeable_mask is not None
+            and opened_shifted_block_mask is not None
+            and shifted_route_scores.shape[2] > 0
+        ):
+            shifted_prior = self._straight_through_block_prior(
+                shifted_route_scores,
+                shifted_routeable_mask,
+                opened_shifted_block_mask,
+            )
+            shifted_offset = self.config.shifted_block_offset_value
+            shifted_num_blocks = shifted_route_scores.shape[2]
+            shifted_candidate_blocks = (
+                (candidate_indices.clamp_min(0) - shifted_offset) // self.config.block_size
+            ).clamp(min=0, max=shifted_num_blocks - 1)
+            gathered_shifted_prior = torch.gather(
+                shifted_prior,
+                dim=2,
+                index=shifted_candidate_blocks,
+            )
+            gathered_shifted_opened = torch.gather(
+                opened_shifted_block_mask,
+                dim=2,
+                index=shifted_candidate_blocks,
+            )
+            belongs_to_shifted_grid = candidate_indices >= shifted_offset
+            shifted_prior = torch.where(
+                gathered_shifted_opened & belongs_to_shifted_grid & candidate_mask,
+                gathered_shifted_prior,
+                torch.zeros_like(gathered_shifted_prior),
+            )
+            prior = torch.maximum(prior, shifted_prior)
+
+        prior_bias = torch.log(prior.clamp_min(self.config.eps))
+        return torch.where(prior > 0, prior_bias, torch.zeros_like(prior_bias))
+
+    def _straight_through_block_prior(
+        self,
+        route_scores: torch.Tensor,
+        routeable_mask: torch.Tensor,
+        opened_block_mask: torch.Tensor,
     ) -> torch.Tensor:
         batch, seq_len, num_blocks, centroids_per_block = route_scores.shape
         flat_scores = route_scores.reshape(batch, seq_len, num_blocks * centroids_per_block)
@@ -266,15 +400,7 @@ class UABLAAttention(nn.Module):
         )
 
         hard_block = opened_block_mask.to(route_scores.dtype)
-        straight_through_block = hard_block + soft_block - soft_block.detach()
-
-        candidate_blocks = (candidate_indices.clamp_min(0) // self.config.block_size).clamp(
-            max=num_blocks - 1,
-        )
-        gathered_prior = torch.gather(straight_through_block, dim=2, index=candidate_blocks)
-        gathered_opened = torch.gather(opened_block_mask, dim=2, index=candidate_blocks)
-        prior_bias = torch.log(gathered_prior.clamp_min(self.config.eps))
-        return torch.where(gathered_opened & candidate_mask, prior_bias, torch.zeros_like(prior_bias))
+        return hard_block + soft_block - soft_block.detach()
 
     def _relative_position_bias(self, candidate_indices: torch.Tensor, seq_len: int) -> torch.Tensor:
         positions = torch.arange(seq_len, device=candidate_indices.device).view(1, seq_len, 1)

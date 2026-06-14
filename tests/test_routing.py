@@ -13,6 +13,7 @@ from uabla.routing import (
     compute_centroid_route_scores,
     compute_superblock_route_scores,
     summarize_block_centroids,
+    summarize_shifted_block_centroids,
     summarize_superblock_centroids,
     uncertainty_to_bucket_values,
 )
@@ -47,6 +48,25 @@ def test_four_centroid_summary_shapes() -> None:
     assert centroids.mu.shape == (2, 3, 4, 8)
     assert centroids.log_sigma.shape == (2, 3, 4, 8)
     assert centroids.weight_sum.shape == (2, 3, 4)
+
+
+def test_shifted_centroid_summary_starts_at_offset() -> None:
+    config = UABLAConfig(hidden_size=16, routing_dim=8, value_dim=12, position_dim=4, block_size=4)
+    mu = torch.randn(2, 10, config.routing_dim)
+    log_sigma = torch.zeros_like(mu)
+    assignment_logits = torch.randn(2, 10, config.centroids_per_block)
+
+    centroids = summarize_shifted_block_centroids(
+        mu,
+        log_sigma,
+        assignment_logits,
+        block_size=config.block_size,
+        block_start_offset=config.shifted_block_offset_value,
+    )
+
+    assert centroids.mu.shape == (2, 2, 4, 8)
+    assert centroids.log_sigma.shape == (2, 2, 4, 8)
+    assert centroids.weight_sum.shape == (2, 2, 4)
 
 
 def test_candidate_indices_are_causal() -> None:
@@ -143,6 +163,67 @@ def test_vectorized_candidate_indices_are_causal_and_fixed_shape() -> None:
             valid = candidates.indices[batch_idx, token_idx][candidates.mask[batch_idx, token_idx]]
             assert valid.numel() > 0
             assert int(valid.max().item()) <= token_idx
+
+
+def test_vectorized_shifted_blocks_keep_candidate_width_and_cross_boundaries() -> None:
+    config = UABLAConfig(
+        hidden_size=16,
+        routing_dim=8,
+        value_dim=12,
+        position_dim=4,
+        block_size=4,
+        local_window=1,
+        centroid_hit_buckets=(1,),
+        token_k_buckets=(4,),
+        use_multiscale_routing=False,
+        adaptive_budgets=False,
+    )
+    batch = 1
+    seq_len = 10
+    num_blocks = 3
+    num_shifted_blocks = 2
+    mu = torch.randn(batch, seq_len, config.routing_dim)
+    log_sigma = torch.zeros_like(mu)
+    centroids = summarize_block_centroids(
+        mu,
+        log_sigma,
+        torch.randn(batch, seq_len, config.centroids_per_block),
+        block_size=config.block_size,
+    )
+    route_scores = torch.full(
+        (batch, seq_len, num_blocks, config.centroids_per_block),
+        -10.0,
+    )
+    routeable_mask = torch.zeros_like(route_scores, dtype=torch.bool)
+    routeable_mask[:, 3:, 0] = True
+    shifted_route_scores = torch.full(
+        (batch, seq_len, num_shifted_blocks, config.centroids_per_block),
+        -10.0,
+    )
+    shifted_routeable_mask = torch.zeros_like(shifted_route_scores, dtype=torch.bool)
+    shifted_route_scores[:, 5, 0, 0] = 10.0
+    shifted_routeable_mask[:, 5:, 0] = True
+
+    candidates = build_candidate_indices_vectorized(
+        mu,
+        log_sigma,
+        centroids,
+        config,
+        route_scores=route_scores,
+        routeable_mask=routeable_mask,
+        shifted_route_scores=shifted_route_scores,
+        shifted_routeable_mask=shifted_routeable_mask,
+    )
+
+    assert candidates.indices.shape == (
+        batch,
+        seq_len,
+        config.local_window + max(config.centroid_hit_buckets) * config.block_size,
+    )
+    valid_at_boundary = candidates.indices[0, 5][candidates.mask[0, 5]].tolist()
+    assert {2, 3, 4}.issubset(set(valid_at_boundary))
+    assert candidates.opened_shifted_block_mask is not None
+    assert bool(candidates.opened_shifted_block_mask[0, 5, 0])
 
 
 def test_duplicate_candidate_mask_keeps_first_occurrence() -> None:

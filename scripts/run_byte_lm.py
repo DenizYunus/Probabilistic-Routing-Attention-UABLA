@@ -76,6 +76,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--byte-route-patch-size", type=int, default=16)
     parser.add_argument("--routed-span-left", type=int, default=2)
     parser.add_argument("--routed-span-right", type=int, default=8)
+    parser.add_argument("--no-shifted-routing-blocks", action="store_true")
+    parser.add_argument("--shifted-block-offset", type=int)
     parser.add_argument("--needle-code-length", type=int, default=12)
     parser.add_argument("--needle-min-gap", type=int, default=768)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -91,6 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="float16")
     parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--init-checkpoint", type=Path)
     parser.add_argument("--save-checkpoint", type=Path)
     return parser.parse_args()
 
@@ -165,6 +168,8 @@ def main() -> None:
             vectorized_routing=not args.no_vectorized_routing,
             routed_span_left=args.routed_span_left,
             routed_span_right=args.routed_span_right,
+            use_shifted_blocks=not args.no_shifted_routing_blocks,
+            shifted_block_offset=args.shifted_block_offset,
         )
     model = TinyTransformerLM(
         vocab_size=BYTE_LM_VOCAB_SIZE,
@@ -175,7 +180,12 @@ def main() -> None:
         local_window=args.local_window,
         uabla_config=uabla_config,
         input_mixer_kernel=args.byte_mixer_kernel,
-    ).to(device)
+    )
+    if args.init_checkpoint is not None:
+        checkpoint = torch.load(args.init_checkpoint, map_location="cpu", weights_only=False)
+        state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+        model.load_state_dict(state_dict, strict=True)
+    model = model.to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     log_index = 0
 
@@ -205,6 +215,14 @@ def main() -> None:
                 "byte_route_patch_size": args.byte_route_patch_size,
                 "routed_span_left": args.routed_span_left if args.attention == "uabla" else None,
                 "routed_span_right": args.routed_span_right if args.attention == "uabla" else None,
+                "shifted_routing_blocks": (
+                    not args.no_shifted_routing_blocks if args.attention == "uabla" else None
+                ),
+                "shifted_block_offset": (
+                    uabla_config.shifted_block_offset_value
+                    if uabla_config is not None and uabla_config.use_shifted_blocks
+                    else None
+                ),
                 "needle_code_length": args.needle_code_length if args.task == "needle" else None,
                 "needle_min_gap": args.needle_min_gap if args.task == "needle" else None,
                 "steps": args.steps,
@@ -219,6 +237,9 @@ def main() -> None:
                 "amp": args.amp,
                 "amp_dtype": args.amp_dtype,
                 "grad_accum_steps": args.grad_accum_steps,
+                "init_checkpoint": (
+                    str(args.init_checkpoint) if args.init_checkpoint is not None else None
+                ),
                 "lm_loss_weight": args.lm_loss_weight,
                 "answer_loss_weight": args.answer_loss_weight,
                 "diagnostics_every": args.diagnostics_every,
