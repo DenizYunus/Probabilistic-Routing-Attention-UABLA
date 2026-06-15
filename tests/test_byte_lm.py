@@ -324,6 +324,62 @@ def test_stage_training_can_wait_for_answer_accuracy_threshold() -> None:
     assert model.uabla_config.use_shifted_blocks
 
 
+def test_stage_training_respects_answer_accuracy_min_step() -> None:
+    torch.manual_seed(14)
+    byte_ids = bytes_to_ids(ensure_min_bytes(b"minimum shifted gate test ", min_length=256))
+    train_ids, _ = split_byte_stream(byte_ids, seq_len=96, eval_fraction=0.25)
+    loader = make_byte_loader(
+        ByteNeedleRecallDataset(
+            train_ids,
+            ByteNeedleRecallConfig(seq_len=96, dataset_size=4, seed=14, code_length=4, min_gap=24),
+        ),
+        batch_size=2,
+        shuffle=False,
+    )
+    config = UABLAConfig(
+        hidden_size=16,
+        routing_dim=8,
+        value_dim=12,
+        position_dim=4,
+        block_size=4,
+        local_window=4,
+        centroid_hit_buckets=(4, 8),
+        token_k_buckets=(2, 4),
+        superblock_size_blocks=2,
+        superblock_hit_buckets=(2, 4),
+        use_shifted_blocks=True,
+    )
+    model = TinyTransformerLM(
+        vocab_size=BYTE_LM_VOCAB_SIZE,
+        max_seq_len=96,
+        hidden_size=16,
+        num_layers=1,
+        attention_type="uabla",
+        local_window=4,
+        uabla_config=config,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    events: list[dict[str, object]] = []
+
+    train_byte_lm_steps(
+        model,
+        loader,
+        steps=2,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        lm_loss_weight=0.2,
+        answer_loss_weight=1.0,
+        log_every=1,
+        shifted_enable_answer_accuracy=0.0,
+        shifted_enable_min_step=3,
+        stage_callback=events.append,
+    )
+
+    assert events == []
+    assert model.uabla_config is not None
+    assert not model.uabla_config.use_shifted_blocks
+
+
 def test_route_budget_curriculum_updates_buckets_during_training() -> None:
     torch.manual_seed(12)
     byte_ids = bytes_to_ids(ensure_min_bytes(b"budget curriculum byte test ", min_length=128))
@@ -394,3 +450,56 @@ def test_route_budget_curriculum_updates_buckets_during_training() -> None:
     assert model.uabla_config is not None
     assert model.uabla_config.centroid_hit_buckets == (4, 8)
     assert model.uabla_config.token_k_buckets == (4, 8)
+
+
+def test_byte_needle_route_auxiliaries_train_one_step() -> None:
+    torch.manual_seed(13)
+    byte_ids = bytes_to_ids(ensure_min_bytes(b"route auxiliary byte needle test ", min_length=256))
+    train_ids, _ = split_byte_stream(byte_ids, seq_len=96, eval_fraction=0.25)
+    loader = make_byte_loader(
+        ByteNeedleRecallDataset(
+            train_ids,
+            ByteNeedleRecallConfig(seq_len=96, dataset_size=4, seed=13, code_length=4, min_gap=24),
+        ),
+        batch_size=2,
+        shuffle=False,
+    )
+    config = UABLAConfig(
+        hidden_size=16,
+        routing_dim=8,
+        value_dim=12,
+        position_dim=4,
+        block_size=4,
+        local_window=8,
+        centroid_hit_buckets=(4, 8),
+        token_k_buckets=(8, 16),
+        superblock_size_blocks=2,
+        superblock_hit_buckets=(2, 4),
+        use_shifted_blocks=False,
+    )
+    model = TinyTransformerLM(
+        vocab_size=BYTE_LM_VOCAB_SIZE,
+        max_seq_len=96,
+        hidden_size=16,
+        num_layers=1,
+        attention_type="uabla",
+        local_window=8,
+        uabla_config=config,
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    history = train_byte_lm_steps(
+        model,
+        loader,
+        steps=1,
+        optimizer=optimizer,
+        device=torch.device("cpu"),
+        lm_loss_weight=0.2,
+        answer_loss_weight=1.0,
+        direct_route_weight=0.05,
+        token_contrast_weight=0.01,
+        log_every=1,
+    )
+
+    assert len(history) == 1
+    assert torch.isfinite(torch.tensor(history[0].loss))

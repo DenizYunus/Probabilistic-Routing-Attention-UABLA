@@ -24,7 +24,11 @@ from .experiment import (
     language_model_loss,
     move_batch,
 )
-from .losses import route_entropy_floor_loss
+from .losses import (
+    direct_routing_supervision_loss,
+    route_entropy_floor_loss,
+    token_contrastive_retrieval_loss,
+)
 from .model import TinyTransformerLM
 
 BYTE_PAD_TOKEN = 256
@@ -330,11 +334,19 @@ def train_byte_lm_steps(
     log_every: int = 10,
     shifted_enable_step: int | None = None,
     shifted_enable_answer_accuracy: float | None = None,
+    shifted_enable_min_step: int = 1,
     route_budget_stages: tuple[RoutingBudgetStage, ...] = (),
     route_entropy_weight: float = 0.0,
     route_entropy_min: float = 0.35,
     route_entropy_warmup_steps: int = 0,
     route_entropy_decay_steps: int = 0,
+    direct_route_weight: float = 0.0,
+    direct_route_warmup_steps: int = 0,
+    direct_route_decay_steps: int = 0,
+    token_contrast_weight: float = 0.0,
+    token_contrast_warmup_steps: int = 0,
+    token_contrast_decay_steps: int = 0,
+    token_contrast_temperature: float = 1.0,
     stage_callback: Callable[[dict[str, object]], None] | None = None,
     metrics_callback: Callable[[ByteLMMetrics], None] | None = None,
 ) -> list[ByteLMMetrics]:
@@ -356,6 +368,8 @@ def train_byte_lm_steps(
         if model.attention_type != "uabla":
             raise ValueError("shifted routing stages require UABLA attention")
         model.set_uabla_shifted_blocks(False)
+    if shifted_enable_min_step <= 0:
+        raise ValueError("shifted_enable_min_step must be positive")
     if route_budget_stages:
         if model.attention_type != "uabla":
             raise ValueError("route budget curriculum requires UABLA attention")
@@ -366,6 +380,16 @@ def train_byte_lm_steps(
         raise ValueError("route_entropy_min must be in [0, 1]")
     if route_entropy_warmup_steps < 0 or route_entropy_decay_steps < 0:
         raise ValueError("route entropy schedule steps must be non-negative")
+    if direct_route_weight < 0:
+        raise ValueError("direct_route_weight cannot be negative")
+    if direct_route_warmup_steps < 0 or direct_route_decay_steps < 0:
+        raise ValueError("direct route schedule steps must be non-negative")
+    if token_contrast_weight < 0:
+        raise ValueError("token_contrast_weight cannot be negative")
+    if token_contrast_warmup_steps < 0 or token_contrast_decay_steps < 0:
+        raise ValueError("token contrast schedule steps must be non-negative")
+    if token_contrast_temperature <= 0:
+        raise ValueError("token_contrast_temperature must be positive")
     if amp_dtype is None:
         amp_dtype = torch.float16
     model.train()
@@ -434,6 +458,18 @@ def train_byte_lm_steps(
             warmup_steps=route_entropy_warmup_steps,
             decay_steps=route_entropy_decay_steps,
         )
+        current_direct_route_weight = _scheduled_aux_weight(
+            direct_route_weight,
+            step=step,
+            warmup_steps=direct_route_warmup_steps,
+            decay_steps=direct_route_decay_steps,
+        )
+        current_token_contrast_weight = _scheduled_aux_weight(
+            token_contrast_weight,
+            step=step,
+            warmup_steps=token_contrast_warmup_steps,
+            decay_steps=token_contrast_decay_steps,
+        )
         optimizer.zero_grad(set_to_none=True)
         last_batch = None
         last_logits = None
@@ -443,11 +479,17 @@ def train_byte_lm_steps(
         for _ in range(grad_accum_steps):
             batch = move_batch(next(stream), device)
             with _autocast_context(device, enabled=amp, dtype=amp_dtype):
-                needs_routing = model.attention_type == "uabla" and current_route_entropy_weight > 0
+                needs_routing = model.attention_type == "uabla" and (
+                    current_route_entropy_weight > 0
+                    or current_direct_route_weight > 0
+                    or current_token_contrast_weight > 0
+                )
+                needs_token_scores = needs_routing and current_token_contrast_weight > 0
                 output = model(
                     batch["input_ids"],
                     return_routing=needs_routing,
                     return_attention=False,
+                    return_token_scores=needs_token_scores,
                 )
                 lm_loss = language_model_loss(output.logits, batch["labels"])
                 loss = lm_loss_weight * lm_loss
@@ -464,6 +506,30 @@ def train_byte_lm_steps(
                     if entropy_losses:
                         loss = loss + current_route_entropy_weight * torch.stack(
                             entropy_losses,
+                        ).mean()
+                if (
+                    current_direct_route_weight > 0
+                    and output.uabla_outputs
+                    and "answer_source_index" in batch
+                ):
+                    direct_route_losses = _direct_route_losses_from_output(model, output, batch)
+                    if direct_route_losses:
+                        loss = loss + current_direct_route_weight * torch.stack(
+                            direct_route_losses,
+                        ).mean()
+                if (
+                    current_token_contrast_weight > 0
+                    and output.uabla_outputs
+                    and "answer_source_index" in batch
+                ):
+                    token_contrast_losses = _token_contrast_losses_from_output(
+                        output,
+                        batch,
+                        temperature=token_contrast_temperature,
+                    )
+                    if token_contrast_losses:
+                        loss = loss + current_token_contrast_weight * torch.stack(
+                            token_contrast_losses,
                         ).mean()
             scaler.scale(loss / grad_accum_steps).backward()
             token_count += batch["input_ids"].numel()
@@ -510,6 +576,7 @@ def train_byte_lm_steps(
                 shifted_enable_answer_accuracy is not None
                 and not shifted_stage_enabled
                 and step < steps
+                and step + 1 >= shifted_enable_min_step
                 and metrics[-1].answer_accuracy is not None
                 and metrics[-1].answer_accuracy >= shifted_enable_answer_accuracy
             ):
@@ -752,6 +819,63 @@ def _route_entropy_losses_from_output(
                     min_normalized_entropy=min_normalized_entropy,
                 )
             )
+    return losses
+
+
+def _direct_route_losses_from_output(
+    model: TinyTransformerLM,
+    output,
+    batch: dict[str, torch.Tensor],
+) -> list[torch.Tensor]:
+    if model.uabla_config is None:
+        raise RuntimeError("uabla_config missing")
+    losses: list[torch.Tensor] = []
+    for layer in output.uabla_outputs:
+        if layer.route_scores is not None and layer.routeable_mask is not None:
+            losses.append(
+                direct_routing_supervision_loss(
+                    layer.route_scores,
+                    layer.routeable_mask,
+                    batch["answer_index"],
+                    batch["answer_source_index"],
+                    region_size_tokens=model.uabla_config.block_size,
+                )
+            )
+        if layer.superblock_route_scores is not None and layer.superblock_routeable_mask is not None:
+            losses.append(
+                direct_routing_supervision_loss(
+                    layer.superblock_route_scores,
+                    layer.superblock_routeable_mask,
+                    batch["answer_index"],
+                    batch["answer_source_index"],
+                    region_size_tokens=(
+                        model.uabla_config.block_size * model.uabla_config.superblock_size_blocks
+                    ),
+                )
+            )
+    return losses
+
+
+def _token_contrast_losses_from_output(
+    output,
+    batch: dict[str, torch.Tensor],
+    *,
+    temperature: float,
+) -> list[torch.Tensor]:
+    losses: list[torch.Tensor] = []
+    for layer in output.uabla_outputs:
+        if layer.token_scores is None or layer.candidates is None:
+            continue
+        losses.append(
+            token_contrastive_retrieval_loss(
+                layer.token_scores,
+                layer.candidates.indices,
+                layer.candidates.mask,
+                batch["answer_index"],
+                batch["answer_source_index"],
+                temperature=temperature,
+            )
+        )
     return losses
 
 

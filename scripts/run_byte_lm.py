@@ -81,6 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shifted-block-offset", type=int)
     parser.add_argument("--stage-shifted-after-steps", type=int)
     parser.add_argument("--stage-shifted-when-answer-accuracy", type=float)
+    parser.add_argument("--stage-shifted-min-step", type=int, default=1)
     parser.add_argument("--needle-code-length", type=int, default=12)
     parser.add_argument("--needle-min-gap", type=int, default=768)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -99,6 +100,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--route-entropy-min", type=float, default=0.35)
     parser.add_argument("--route-entropy-warmup-steps", type=int, default=0)
     parser.add_argument("--route-entropy-decay-steps", type=int, default=0)
+    parser.add_argument("--direct-route-weight", type=float, default=0.0)
+    parser.add_argument("--direct-route-warmup-steps", type=int, default=0)
+    parser.add_argument("--direct-route-decay-steps", type=int, default=0)
+    parser.add_argument("--token-contrast-weight", type=float, default=0.0)
+    parser.add_argument("--token-contrast-warmup-steps", type=int, default=0)
+    parser.add_argument("--token-contrast-decay-steps", type=int, default=0)
+    parser.add_argument("--token-contrast-temperature", type=float, default=1.0)
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--amp-dtype", choices=["float16", "bfloat16"], default="float16")
     parser.add_argument("--grad-accum-steps", type=int, default=1)
@@ -183,6 +191,8 @@ def main() -> None:
     if args.stage_shifted_when_answer_accuracy is not None:
         if not 0.0 <= args.stage_shifted_when_answer_accuracy <= 1.0:
             raise ValueError("--stage-shifted-when-answer-accuracy must be in [0, 1]")
+    if args.stage_shifted_min_step <= 0:
+        raise ValueError("--stage-shifted-min-step must be positive")
     if budget_stages and args.attention != "uabla":
         raise ValueError("--route-budget-curriculum requires --attention uabla")
     if args.route_entropy_weight < 0:
@@ -193,6 +203,20 @@ def main() -> None:
         raise ValueError("--route-entropy-min must be in [0, 1]")
     if args.route_entropy_warmup_steps < 0 or args.route_entropy_decay_steps < 0:
         raise ValueError("route entropy schedule steps must be non-negative")
+    if args.direct_route_weight < 0:
+        raise ValueError("--direct-route-weight cannot be negative")
+    if args.direct_route_weight > 0 and args.attention != "uabla":
+        raise ValueError("--direct-route-weight requires --attention uabla")
+    if args.direct_route_warmup_steps < 0 or args.direct_route_decay_steps < 0:
+        raise ValueError("direct route schedule steps must be non-negative")
+    if args.token_contrast_weight < 0:
+        raise ValueError("--token-contrast-weight cannot be negative")
+    if args.token_contrast_weight > 0 and args.attention != "uabla":
+        raise ValueError("--token-contrast-weight requires --attention uabla")
+    if args.token_contrast_warmup_steps < 0 or args.token_contrast_decay_steps < 0:
+        raise ValueError("token contrast schedule steps must be non-negative")
+    if args.token_contrast_temperature <= 0:
+        raise ValueError("--token-contrast-temperature must be positive")
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
@@ -324,6 +348,7 @@ def main() -> None:
                     else None
                 ),
                 "stage_shifted_after_steps": args.stage_shifted_after_steps,
+                "stage_shifted_min_step": args.stage_shifted_min_step,
                 "stage_shifted_when_answer_accuracy": args.stage_shifted_when_answer_accuracy,
                 "needle_code_length": args.needle_code_length if args.task == "needle" else None,
                 "needle_min_gap": args.needle_min_gap if args.task == "needle" else None,
@@ -354,6 +379,13 @@ def main() -> None:
                 "route_entropy_min": args.route_entropy_min,
                 "route_entropy_warmup_steps": args.route_entropy_warmup_steps,
                 "route_entropy_weight": args.route_entropy_weight,
+                "direct_route_decay_steps": args.direct_route_decay_steps,
+                "direct_route_warmup_steps": args.direct_route_warmup_steps,
+                "direct_route_weight": args.direct_route_weight,
+                "token_contrast_decay_steps": args.token_contrast_decay_steps,
+                "token_contrast_temperature": args.token_contrast_temperature,
+                "token_contrast_warmup_steps": args.token_contrast_warmup_steps,
+                "token_contrast_weight": args.token_contrast_weight,
             },
             sort_keys=True,
         ),
@@ -376,11 +408,19 @@ def main() -> None:
         log_every=args.log_every,
         shifted_enable_step=args.stage_shifted_after_steps,
         shifted_enable_answer_accuracy=args.stage_shifted_when_answer_accuracy,
+        shifted_enable_min_step=args.stage_shifted_min_step,
         route_budget_stages=budget_stages,
         route_entropy_weight=args.route_entropy_weight,
         route_entropy_min=args.route_entropy_min,
         route_entropy_warmup_steps=args.route_entropy_warmup_steps,
         route_entropy_decay_steps=args.route_entropy_decay_steps,
+        direct_route_weight=args.direct_route_weight,
+        direct_route_warmup_steps=args.direct_route_warmup_steps,
+        direct_route_decay_steps=args.direct_route_decay_steps,
+        token_contrast_weight=args.token_contrast_weight,
+        token_contrast_warmup_steps=args.token_contrast_warmup_steps,
+        token_contrast_decay_steps=args.token_contrast_decay_steps,
+        token_contrast_temperature=args.token_contrast_temperature,
         stage_callback=emit_stage_event,
         metrics_callback=emit_train_metrics,
     )
