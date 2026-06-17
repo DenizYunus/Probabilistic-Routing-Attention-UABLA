@@ -30,6 +30,8 @@ from uabla.byte_lm import (
 from uabla.config import UABLAConfig
 from uabla.model import TinyTransformerLM
 
+UABLA_V1_BYTE_NEEDLE_RECIPE = "uabla-v1-byte-needle"
+
 
 def default_device() -> str:
     if torch.cuda.is_available():
@@ -59,6 +61,12 @@ def amp_dtype_from_arg(value: str) -> torch.dtype:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--recipe",
+        choices=["none", UABLA_V1_BYTE_NEEDLE_RECIPE],
+        default="none",
+        help="Apply a locked experiment recipe before validation.",
+    )
     parser.add_argument("--attention", choices=["uabla", "dense", "local"], default="uabla")
     parser.add_argument("--task", choices=["lm", "needle"], default="lm")
     parser.add_argument("--byte-mode", choices=["raw"], default="raw")
@@ -112,7 +120,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--init-checkpoint", type=Path)
     parser.add_argument("--save-checkpoint", type=Path)
-    return parser.parse_args()
+    args = parser.parse_args()
+    apply_recipe(args)
+    return args
+
+
+def apply_recipe(args: argparse.Namespace) -> None:
+    """Apply locked experiment presets while leaving size/runtime knobs configurable."""
+
+    if args.recipe == "none":
+        return
+    if args.recipe != UABLA_V1_BYTE_NEEDLE_RECIPE:
+        raise ValueError(f"unknown recipe: {args.recipe}")
+
+    args.attention = "uabla"
+    args.task = "needle"
+    args.local_window = 128
+    args.byte_route_patch_size = 16
+    args.routed_span_left = 2
+    args.routed_span_right = 8
+    args.route_budget_curriculum = "explore"
+    args.route_budget_curriculum_boundaries = "2500,6500"
+    args.stage_shifted_when_answer_accuracy = 0.5
+    args.stage_shifted_min_step = 6501
+    args.route_entropy_weight = 0.02
+    args.route_entropy_min = 0.35
+    args.route_entropy_warmup_steps = 0
+    args.route_entropy_decay_steps = 6500
+    args.direct_route_weight = 0.0
+    args.direct_route_warmup_steps = 0
+    args.direct_route_decay_steps = 0
+    args.token_contrast_weight = 0.0005
+    args.token_contrast_warmup_steps = 1000
+    args.token_contrast_decay_steps = 3500
+    args.token_contrast_temperature = 0.7
 
 
 def build_route_budget_stages(args: argparse.Namespace) -> tuple[RoutingBudgetStage, ...]:
@@ -328,6 +369,7 @@ def main() -> None:
         json.dumps(
             {
                 "phase": "start",
+                "recipe": args.recipe,
                 "attention": args.attention,
                 "task": args.task,
                 "byte_mode": args.byte_mode,

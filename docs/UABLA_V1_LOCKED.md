@@ -45,6 +45,63 @@ to reduce cache memory and long-context attention compute.
 15. Never materialize a full `T x T` distance matrix in serious paths.
 16. Treat this as an attention/cache research prototype, not a DeepSeek-scale training recipe.
 
+## Validated Byte-Needle V1 Recipe
+
+Status: locked as the current validated training recipe for byte-level
+needle-in-haystack experiments.
+
+Use the named CLI recipe:
+
+```bash
+python scripts/run_byte_lm.py --recipe uabla-v1-byte-needle ...
+```
+
+The recipe locks the training-only routing scaffold to:
+
+```text
+direct_route_weight = 0.0
+token_contrast_weight = 0.0005
+token_contrast_warmup_steps = 1000
+token_contrast_decay_steps = 3500
+token_contrast_temperature = 0.7
+route_entropy_weight = 0.02
+route_entropy_min = 0.35
+route_entropy_decay_steps = 6500
+route_budget_curriculum = explore
+route_budget_curriculum_boundaries = 2500,6500
+stage_shifted_when_answer_accuracy = 0.5
+stage_shifted_min_step = 6501
+local_window = 128
+byte_route_patch_size = 16
+routed_span_left = 2
+routed_span_right = 8
+```
+
+The budget curriculum is:
+
+```text
+step 1:    superblock [4, 8], centroid [16, 32], token [32, 64]
+step 2501: superblock [2, 4], centroid [8, 16],  token [16, 32]
+step 6501: superblock [2, 4], centroid [4, 8],  token [8, 16]
+```
+
+The validated floor on TinyStories byte needle recall at sequence length 1024:
+
+| Token contrast weight | Final answer accuracy | Result |
+| ---: | ---: | --- |
+| 0.0005 | 99.9674% | locked V1 setting |
+| 0.0002 | 99.7721% | works, but near the cliff |
+| 0.0 | 9.1309% | fails |
+
+Interpretation:
+
+```text
+direct route supervision is not part of the locked V1 recipe
+token contrast is a tiny training-only retrieval hint
+inference uses no auxiliary loss
+cache stays at the configured UABLA cache dimension
+```
+
 ## Locked Dimensions
 
 UABLA-448 cache dimensions per token per layer:

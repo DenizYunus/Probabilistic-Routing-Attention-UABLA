@@ -358,24 +358,17 @@ PYTHONPATH=src python scripts/run_byte_lm.py \
 Shifted routing blocks are enabled by default. Use
 `--no-shifted-routing-blocks` for ablations against the single-grid router.
 
-Stage shifted routing without a manual checkpoint:
+Locked V1 UABLA byte-needle recipe:
 
 ```bash
 PYTHONPATH=src python scripts/run_byte_lm.py \
-  --task needle \
-  --attention uabla \
+  --recipe uabla-v1-byte-needle \
   --text-file data/tinystories_combo.txt \
   --seq-len 1024 \
   --needle-min-gap 768 \
   --needle-code-length 12 \
   --local-window 128 \
   --steps 10000 \
-  --stage-shifted-when-answer-accuracy 0.5 \
-  --route-budget-curriculum explore \
-  --route-budget-curriculum-boundaries 2500,6500 \
-  --route-entropy-weight 0.02 \
-  --route-entropy-min 0.35 \
-  --route-entropy-decay-steps 6500 \
   --batch-size 4 \
   --hidden-size 128 \
   --layers 4 \
@@ -388,12 +381,85 @@ PYTHONPATH=src python scripts/run_byte_lm.py \
   --diagnostics-every 500 \
   --amp \
   --log-every 100 \
-  --save-checkpoint runs/byte_needle_uabla_staged_shifted.pt \
-  2>&1 | tee runs/byte_needle_uabla_staged_shifted.log
+  --save-checkpoint runs/byte_needle_uabla_v1_contrast0005.pt \
+  2>&1 | tee runs/byte_needle_uabla_v1_contrast0005.log
 ```
 
-This starts with a wide sparse routing budget, narrows it in two phases, and
-decays an entropy floor so the router explores before specializing. Shifted
-blocks are enabled after a logged training batch reaches 50% answer accuracy,
-then training continues with the same weights and optimizer. Use
-`--stage-shifted-after-steps N` instead when you want a fixed-step ablation.
+This recipe starts with a wide sparse routing budget, narrows it in two phases,
+and decays an entropy floor so the router explores before specializing. It uses
+no direct route supervision. The only routing scaffold is a tiny training-only
+token contrast hint:
+
+```text
+token_contrast_weight = 0.0005
+```
+
+Shifted blocks are enabled after a logged training batch reaches 50% answer
+accuracy, but not before step 6501. Use `--stage-shifted-after-steps N`
+instead when you want a fixed-step ablation.
+
+Validated TinyStories byte-needle floor at sequence length 1024:
+
+| Token contrast weight | Final answer accuracy | Result |
+| ---: | ---: | --- |
+| 0.0005 | 99.9674% | locked V1 setting |
+| 0.0002 | 99.7721% | works, but near the cliff |
+| 0.0 | 9.1309% | fails |
+
+## Harder Long-Context Tests
+
+After the locked 1024-token recipe passes, move to a larger gap. First target:
+
+```bash
+PYTHONPATH=src python scripts/run_byte_lm.py \
+  --recipe uabla-v1-byte-needle \
+  --text-file data/tinystories_combo.txt \
+  --seq-len 2048 \
+  --needle-min-gap 1536 \
+  --needle-code-length 12 \
+  --local-window 128 \
+  --steps 12000 \
+  --batch-size 2 \
+  --hidden-size 128 \
+  --layers 4 \
+  --byte-mixer-kernel 5 \
+  --byte-route-patch-size 16 \
+  --routed-span-left 2 \
+  --routed-span-right 8 \
+  --lm-loss-weight 0.2 \
+  --answer-loss-weight 5.0 \
+  --diagnostics-every 500 \
+  --eval-batches 128 \
+  --amp \
+  --log-every 100 \
+  --save-checkpoint runs/byte_needle_uabla_v1_2048_gap1536.pt \
+  2>&1 | tee runs/byte_needle_uabla_v1_2048_gap1536.log
+```
+
+If 2048 succeeds and memory allows, stretch to 4096:
+
+```bash
+PYTHONPATH=src python scripts/run_byte_lm.py \
+  --recipe uabla-v1-byte-needle \
+  --text-file data/tinystories_combo.txt \
+  --seq-len 4096 \
+  --needle-min-gap 3072 \
+  --needle-code-length 12 \
+  --local-window 128 \
+  --steps 14000 \
+  --batch-size 1 \
+  --hidden-size 128 \
+  --layers 4 \
+  --byte-mixer-kernel 5 \
+  --byte-route-patch-size 16 \
+  --routed-span-left 2 \
+  --routed-span-right 8 \
+  --lm-loss-weight 0.2 \
+  --answer-loss-weight 5.0 \
+  --diagnostics-every 500 \
+  --eval-batches 64 \
+  --amp \
+  --log-every 100 \
+  --save-checkpoint runs/byte_needle_uabla_v1_4096_gap3072.pt \
+  2>&1 | tee runs/byte_needle_uabla_v1_4096_gap3072.log
+```
