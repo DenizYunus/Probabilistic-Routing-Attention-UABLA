@@ -1,6 +1,7 @@
 # Probabilistic Routing Attention
 
-This repository contains a clean V1 prototype of **UABLA-448**:
+This repository contains a clean V1 prototype of **UABLA-448** and a sibling
+MemoryCache track:
 
 ```text
 Uncertainty-Adaptive Block Latent Attention
@@ -34,3 +35,32 @@ with no direct route supervision. The latest TinyStories byte-needle floor was:
 The first test plan is here:
 
 [docs/EXPERIMENT_PLAN.md](docs/EXPERIMENT_PLAN.md)
+
+## MemoryCache Track
+
+MemoryCache is the separate inference-memory/cache-revival line inside this
+repo. It asks a different question from UABLA:
+
+```text
+UABLA:       where should this query look?
+MemoryCache: what old context stays exact, compressed, revivable, or evicted?
+```
+
+Current locked MemoryCache profile:
+
+[docs/MEMORY_CACHE_V1_4_LOCKED.md](docs/MEMORY_CACHE_V1_4_LOCKED.md)
+
+The current V1.4 result on RULER-lite byte aggregation at 4096 bytes:
+
+```text
+efficient profile: source_hit_rate 89.48%, active exact 320, compression 12.8x
+quality profile:   source_hit_rate 94.99%, active exact 384, compression 10.67x
+```
+
+MemoryCache source code and runner:
+
+```text
+src/uabla/memory_cache.py
+src/uabla/ruler_lite.py
+scripts/run_memory_cache_ruler.py
+```
