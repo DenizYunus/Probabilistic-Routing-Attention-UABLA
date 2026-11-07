@@ -36,6 +36,15 @@ The first test plan is here:
 
 [docs/EXPERIMENT_PLAN.md](docs/EXPERIMENT_PLAN.md)
 
+Current locked byte-LM RULER rerank result:
+
+[docs/RULER_RERANK_V1_LOCKED.md](docs/RULER_RERANK_V1_LOCKED.md)
+
+The calibrated 4096-token tokenized RULER multi-needle rerank checkpoint reached
+`92.76%` answer accuracy and `58.79%` exact match with about `10.17GB` peak
+training memory. This locks pure candidate reranking as the current best
+byte-LM answer-decoding path.
+
 ## MemoryCache Track
 
 MemoryCache is the separate inference-memory/cache-revival line inside this
